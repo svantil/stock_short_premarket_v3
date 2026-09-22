@@ -1,0 +1,46 @@
+{
+  "strategy_id": "4am_short",
+  "strategy_name": "4am short",
+  "input_file": "../stock_daily_scanner/outcome/2026-NEW_all.csv",
+  "shares": 10,
+  "output_dir": "outcome/4am_short",
+  "from_date": null,
+  "to_date": null,
+  "symbols": [],
+  "strategy": {
+    "gap_percent": 30,
+    "early_start": "04:00",
+    "early_end": "04:15",
+    "wait_after_high_minutes": 10,
+    "entry_below_high_percent": 10,
+    "entry_deadline": "09:00",
+    "stop_loss_percent": 30,
+    "profit_target_percent": 12.5,
+    "time_exit": "09:30",
+    "high_time_reference": "bar_end",
+    "repeated_high_policy": "last",
+    "intrabar_policy": "conservative",
+    "entry_slippage_bps": 0,
+    "exit_slippage_bps": 0,
+    "commission_per_share_per_side": 0,
+    "locate_fee_per_share": 0,
+    "reentry": {
+      "enabled": true,
+      "entry_above_high_percent": 40,
+      "stop_loss_percent": 30,
+      "profit_target_percent": 50,
+      "entry_deadline": "08:00",
+      "time_exit": "09:20"
+    }
+  },
+  "data": {
+    "api_key_env": "MASSIVE_API_KEY",
+    "env_file": ".env",
+    "cache_dir": ".cache/massive",
+    "timeout_seconds": 30,
+    "max_retries": 3,
+    "request_delay_seconds": 0.25,
+    "previous_close_lookback_days": 14,
+    "calendar_symbol": "SPY"
+  }
+}

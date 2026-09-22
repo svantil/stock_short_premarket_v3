@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>4am short · Trading desk</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="4am short dashboard"><span class="brand-mark">4</span><span><strong>4am short</strong><small>PREMARKET TRADING DESK</small></span></a>
+      <nav aria-label="Dashboard sections"><a href="#live">Live desk</a><a href="#backtest">Backtest</a><a href="#activity">Activity</a></nav>
+      <div class="clock-group"><span class="clock-label">NEW YORK</span><time id="clock">—</time><span id="clockDate" class="muted">Eastern time</span></div>
+    </header>
+
+    <main>
+      <section id="live" class="desk-header">
+        <div><div class="eyebrow">STRATEGY / 4AM SHORT</div><h1>Premarket, in focus.</h1><p class="muted">Early gap. Confirmed high. Short entries with defined exits.</p></div>
+        <div class="desk-controls"><button id="startButton" class="button primary" disabled>Start monitoring</button><button id="stopButton" class="button" disabled>Stop entries</button><button id="coverButton" class="button danger" disabled>Cover positions</button></div>
+      </section>
+
+      <div id="connectionWarning" class="notice warning" role="status">Connecting to the local strategy service…</div>
+      <div id="controlError" class="notice error hidden" role="alert"></div>
+      <section class="status-strip" aria-label="Connection and trading status">
+        <div class="status-main"><span id="modeBadge" class="badge neutral">CONNECTING</span><strong id="executionStatus">Waiting for strategy state</strong><small id="executionDetail">The dashboard does not start trading on page load.</small></div>
+        <div class="connection-card"><span class="muted">Market data</span><strong><i id="sipDot" class="dot"></i>Alpaca SIP</strong><small id="sipStatus">—</small></div>
+        <div class="connection-card"><span class="muted">Execution &amp; locates</span><strong><i id="dasDot" class="dot"></i>DAS Trader Pro</strong><small id="dasStatus">—</small><small id="dasHealthDetail"></small></div>
+        <div class="connection-card"><span class="muted">Previous close</span><strong id="closeDate">—</strong><small id="universeSize">Waiting for stock universe</small></div>
+      </section>
+
+      <section class="metrics" aria-label="Live strategy counts">
+        <article class="metric"><span>Gap triggers</span><strong id="qualifiedCount">0</strong><small id="candidateCount">0 watched stocks</small></article>
+        <article class="metric"><span>Entered</span><strong id="enteredCount">0</strong><small id="skippedCount">0 skipped</small></article>
+        <article class="metric"><span>Open positions</span><strong id="openCount">0</strong><small id="closedCount">0 closed</small></article>
+        <article class="metric"><span>Realized P/L</span><strong id="realizedPnl">—</strong><small id="pnlBasis">Gross fill P/L · before commissions and locates</small></article>
+      </section>
+
+      <section class="rules-panel" aria-label="Active strategy rules"><div class="section-label">THE SETUP <span>ALL TIMES EASTERN</span></div><div id="ruleCards" class="rule-cards"><div class="empty">Loading configured rules…</div></div></section>
+
+      <section class="panel candidates-panel">
+        <div class="panel-header"><div><div class="eyebrow">DISCOVERY &amp; ENTRIES</div><h2>Early gap candidates <span id="candidateBadge" class="count-badge">0</span></h2></div><div class="table-controls"><label class="sr-only" for="symbolFilter">Filter symbols</label><input id="symbolFilter" type="search" placeholder="Filter symbol…" autocomplete="off"><label class="toggle"><input id="qualifiedOnly" type="checkbox">Qualified only</label></div></div>
+        <p id="locateRouteMode" class="locate-policy hidden"></p>
+        <div class="table-wrap"><table class="candidate-table"><thead><tr><th>Stock / prior close</th><th>Gap trigger / time</th><th>Early high / time</th><th>Short limit / active</th><th>Bid / ask</th><th>Locate</th><th>Status / note</th></tr></thead><tbody id="candidateRows"><tr><td colspan="7" class="empty">Start monitoring to discover the early gappers.</td></tr></tbody></table></div>
+        <div class="panel-footer"><span>Quotes and event times shown in Eastern time.</span><span id="candidateFooter">Awaiting market data</span></div>
+      </section>
+
+      <section class="panel positions-panel">
+        <div class="panel-header"><div><div class="eyebrow">DAS EXECUTION</div><h2>Positions &amp; orders <span id="tradeBadge" class="count-badge">0</span></h2></div><span class="muted small" id="fillBasis">Entry and exit prices reflect confirmed fills</span></div>
+        <div class="table-wrap"><table><thead><tr><th>Stock / status</th><th>Filled / requested</th><th>Entry / time</th><th>Stop / target</th><th>Exit / time</th><th>Exit reason / target hit</th><th>Realized P/L</th><th>Locate / note</th></tr></thead><tbody id="tradeRows"><tr><td colspan="8" class="empty">No orders or positions for this session.</td></tr></tbody></table></div>
+        <div class="panel-footer"><span>Stop entries requests entry cancels; managing positions requires working SIP and DAS connections.</span><span id="reentryStatus">Loading re-entry setting…</span></div>
+      </section>
+
+      <section id="backtest" class="panel backtest-panel">
+        <div class="panel-header"><div><div class="eyebrow">MASSIVE HISTORICAL DATA</div><h2>4am short backtest</h2></div><button id="backtestButton" class="button" disabled>Run backtest</button></div>
+        <div class="panel-body"><p id="backtestStatus" class="muted">Checking for saved results…</p><div id="backtestSummary" class="backtest-summary"></div></div>
+        <div class="table-wrap"><table class="monthly-table"><thead><tr><th>Month</th><th>Gap triggers</th><th>Traded</th><th>Not traded</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win%</th><th>Loss%</th><th>Net P/L</th><th>Avg/Trade</th><th>PF</th><th>Max DD</th><th>Win Days</th><th>Loss Days</th><th>Stop Stocks</th></tr></thead><tbody id="monthlyRows"><tr><td colspan="16" class="empty">Run the backtest to see monthly performance.</td></tr></tbody></table></div>
+        <div class="panel-footer"><span>Performance includes completed trades only. All figures use the backtest's saved rules.</span><span id="reentryBacktestSummary">Loading re-entry results…</span></div>
+        <details class="output-details"><summary>Backtest output &amp; report location</summary><p id="reportsDir" class="path">No report directory yet.</p><pre id="backtestOutput">No output yet.</pre></details>
+      </section>
+
+      <section id="activity" class="panel activity-panel"><div class="panel-header"><div><div class="eyebrow">SESSION ACTIVITY</div><h2>Event log</h2></div><span id="eventCount" class="muted small">Latest events</span></div><ol id="eventRows" class="event-list"><li class="empty">No events yet.</li></ol></section>
+      <footer class="page-footer"><span>4am short <span class="muted">/ v3</span></span><span id="updatedAt">Waiting for first update</span></footer>
+    </main>
+  </div>
+
+  <dialog id="coverDialog" aria-labelledby="coverTitle"><form id="coverForm"><div class="eyebrow danger-text">DAS POSITION CONTROL</div><h2 id="coverTitle">Cover tracked positions?</h2><p>This stops new entries and submits cover orders for this strategy's remaining shares in DAS. Orders may fill at a different price from the displayed quote.</p><label for="coverConfirmation">Type <strong>COVER 4AM SHORT</strong> to confirm</label><input id="coverConfirmation" autocomplete="off" spellcheck="false"><div class="dialog-actions"><button id="cancelCover" type="button" class="button">Cancel</button><button id="confirmCover" type="submit" class="button danger" disabled>Submit cover orders</button></div></form></dialog>
+  <noscript><div class="notice error">Enable JavaScript to use the live dashboard.</div></noscript>
+</body>
+</html>

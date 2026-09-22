@@ -1,0 +1,14 @@
+{
+  "backtest_config": "backtest_4am_short.json",
+  "output_dir": "outcome/reentry_sweep",
+  "training_end_date": "2026-06-30",
+  "minimum_training_trades": 20,
+  "minimum_full_sample_trades": 30,
+  "grid": {
+    "entry_above_high_percent": [0, 2.5, 5, 7.5, 10, 12.5, 15, 17.5, 20, 22.5, 25, 27.5, 30],
+    "stop_loss_percent": [10, 15, 20, 25, 30],
+    "profit_target_percent": [20, 30, 40, 50, 60],
+    "entry_deadline": ["06:00", "07:00", "08:00", "09:00", "09:15"],
+    "time_exit": ["09:00", "09:10", "09:20", "09:30"]
+  }
+}

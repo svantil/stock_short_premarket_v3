@@ -1,0 +1,41 @@
+{
+  "strategy_id": "4am_short",
+  "strategy_config": "backtest_4am_short.json",
+  "env_file": ".env",
+  "mode": "das_live",
+  "state_dir": "state/4am_short",
+  "symbols": [],
+  "ui": {"host": "127.0.0.1", "port": 8002},
+  "alpaca": {
+    "paper": false,
+    "rest_timeout_seconds": 20,
+    "batch_size": 200,
+    "rest_concurrency": 3,
+    "reconnect_seconds": 3,
+    "quote_max_age_seconds": 5,
+    "future_tolerance_seconds": 1
+  },
+  "das": {
+    "route": "SMARTPRO",
+    "backup_route": "CBATS",
+    "timeout_seconds": 10,
+    "health_check_seconds": 10,
+    "reconnect_seconds": 5,
+    "locate_quote_wait_seconds": 5,
+    "locate_offer_routes": ["LOCATE4", "LOCATE6"],
+    "locate_limit_price_routes": ["LOCATE10"],
+    "locate_quote_routes": ["LOCATE7", "LOCATE1", "LOCATE8", "LOCATE12", "LOCATE14"],
+    "allow_uncapped_locate_purchases": true
+  },
+  "execution": {
+    "reentry_enabled": true,
+    "max_positions": 0,
+    "max_locate_price": 0.06,
+    "locate_trigger_below_entry_percent": 2,
+    "cover_cushion_percent": 1,
+    "cover_replace_seconds": 3,
+    "poll_seconds": 1,
+    "final_bar_wait_seconds": 35,
+    "shutdown_grace_seconds": 30
+  }
+}

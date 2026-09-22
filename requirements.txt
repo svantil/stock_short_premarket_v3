@@ -1,0 +1,5 @@
+# Python 3.11+. Historical backtests still use only the standard library.
+fastapi>=0.115,<1
+httpx>=0.27,<1
+uvicorn[standard]>=0.30,<1
+websockets>=13,<16
