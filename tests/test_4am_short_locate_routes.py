@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from four_am_short.live.config import DasSettings, load_live_settings
-from four_am_short.live.das import DasClient, DasError
+from four_am_short.live.das import DasClient, DasError, LocateDeferred
 from test_4am_short_live_das import Wire
 
 
@@ -230,9 +230,180 @@ class QuoteRouteProtocolTests(unittest.TestCase):
                     valid = False
 
         self.wire.sent_callback = expire_on_second_inquiry
-        with self.assertRaisesRegex(DasError, "eligibility expired"):
+        with self.assertRaisesRegex(LocateDeferred, "eligibility expired"):
             self.client.ensure_shortable("TEST", 100, .04, still_valid=lambda: valid)
         self.assertEqual(inquiries, 2)
+        self.assertFalse(self.paid_commands())
+
+    def deferred_record(self):
+        with self.assertRaises(LocateDeferred):
+            self.client.ensure_shortable("TEST", 100, .04, still_valid=lambda: False)
+        records = json.loads(self.path.read_text())["locates"]
+        return next(record for key, record in records.items() if ":deferred:" not in key)
+
+    def test_unpaid_deferral_retries_with_new_tokens_and_retains_old_ownership(self):
+        previous = self.deferred_record()
+        old_tokens = {request["token"] for request in previous["requests"]}
+        self.assertFalse(self.paid_commands())
+        self.assertEqual(previous["state"], "entry_deferred")
+        self.assertTrue(previous["deferred_before_paid_send"])
+        self.assertTrue(self.compare()[0])
+        self.assertEqual(len(self.paid_commands()), 1)
+        records = json.loads(self.path.read_text())["locates"]
+        archived = [record for key, record in records.items() if ":deferred:" in key]
+        self.assertEqual(archived, [previous])
+        current = next(record for key, record in records.items() if ":deferred:" not in key)
+        self.assertTrue(old_tokens.isdisjoint(request["token"] for request in current["requests"]))
+        self.assertTrue(old_tokens <= self.client._offers().known.keys())
+
+    def test_restart_rejects_late_old_offer_before_fresh_comparison(self):
+        def pending(row, paid):
+            if row["route"] == "LOCATE4":
+                row["status"] = "Pending"
+        self.wire.locate_mutator = pending
+        previous = self.deferred_record()
+        old = next(row for row in self.wire.locates.values() if row["route"] == "LOCATE4")
+        old.update(status="Offered", price="0.001")
+        self.wire.locate_mutator = None
+        self.client = self.make_client()
+        self.assertTrue(self.compare()[0])
+        self.assertIn(f"SLOFFEROPERATION {old['id']} Reject", self.wire.commands)
+        self.assertNotIn(f"SLOFFEROPERATION {old['id']} Accept", self.wire.commands)
+        self.assertEqual(len(self.paid_commands()), 1)
+        for request in previous["requests"]:
+            self.assertIn(request["token"], self.client._offers().known)
+
+    def test_archived_unpaid_execution_blocks_retry_even_after_restart(self):
+        self.deferred_record()
+        old = next(row for row in self.wire.locates.values() if row["route"] == "LOCATE4")
+        self.deferred_record()  # Archive one never-paid attempt without purchasing.
+        old.update(status="Located", filled=100, open=0)
+        self.client = self.make_client()
+        with self.assertRaisesRegex(DasError, "without this client's acceptance") as error:
+            self.compare()
+        self.assertNotIsInstance(error.exception, LocateDeferred)
+        self.assertFalse(self.paid_commands())
+        self.wire.locates.clear()
+        self.client = self.make_client()
+        with self.assertRaises(DasError):
+            self.compare()
+        self.assertFalse(self.paid_commands())
+
+    def test_post_intent_capped_cancellation_restores_unpaid_phase_and_retries(self):
+        self.client = self.make_client(locate_quote_routes=())
+        checks = iter([True, False])
+        with self.assertRaises(LocateDeferred):
+            self.client.ensure_shortable("TEST", 100, .04, still_valid=lambda: next(checks))
+        record = next(iter(json.loads(self.path.read_text())["locates"].values()))
+        selected = next(request for request in record["requests"] if request["route"] == "LOCATE10")
+        self.assertEqual((record["state"], selected["phase"]), ("entry_deferred", "quote_only"))
+        self.assertFalse(self.paid_commands())
+        self.client = self.make_client(locate_quote_routes=())
+        self.assertTrue(self.compare()[0])
+        self.assertEqual(len(self.paid_commands()), 1)
+
+    def test_retry_purchase_with_unknown_outcome_cannot_be_deferred_or_rebought(self):
+        self.deferred_record()
+        self.wire.purchase_no_ack = True
+        with self.assertRaises(DasError) as failure:
+            self.compare()
+        self.assertNotIsInstance(failure.exception, LocateDeferred)
+        self.assertEqual(len(self.paid_commands()), 1)
+        self.wire.locates.clear()
+        self.client = self.make_client()
+        with self.assertRaisesRegex(DasError, "unconfirmed") as failure:
+            self.client.ensure_shortable("TEST", 100, .04, still_valid=lambda: False)
+        self.assertNotIsInstance(failure.exception, LocateDeferred)
+        self.assertEqual(len(self.paid_commands()), 1)
+        records = json.loads(self.path.read_text())["locates"]
+        self.assertEqual(len(records), 2)
+        current = next(record for key, record in records.items() if ":deferred:" not in key)
+        self.assertEqual(current["state"], "purchase_pending")
+
+    def test_successful_retry_with_unavailable_borrow_does_not_purchase_again(self):
+        self.deferred_record()
+        self.assertTrue(self.compare()[0])
+        self.wire.available = 0
+        self.client = self.make_client()
+        with self.assertRaisesRegex(DasError, "already attempted"):
+            self.compare()
+        self.assertEqual(len(self.paid_commands()), 1)
+
+    def test_post_intent_offer_cancellation_retries_only_new_offer(self):
+        settings = dict(locate_priced_only=False, locate_offer_only=True, locate_quote_routes=())
+        self.client = self.make_client(**settings)
+        checks = iter([True, False])
+        with self.assertRaises(LocateDeferred):
+            self.client.ensure_shortable("TEST", 100, .04, still_valid=lambda: next(checks))
+        old_ids = set(self.wire.locates)
+        self.assertFalse(self.paid_commands())
+        self.client = self.make_client(**settings)
+        self.assertTrue(self.compare()[0])
+        self.assertEqual(len(self.paid_commands()), 1)
+        self.assertTrue(self.paid_commands()[0].endswith(" Accept"))
+        self.assertNotIn(self.paid_commands()[0].split()[1], old_ids)
+
+    def test_uncapped_refresh_cancellation_can_retry_without_duplicate_purchase(self):
+        self.client = self.make_client(allow_uncapped_locate_purchases=True)
+        self.deferred_record()
+        self.assertTrue(self.compare()[0])
+        self.assertEqual(len(self.paid_commands()), 1)
+        self.assertIn(" LOCATE7 ", self.paid_commands()[0])
+
+    def test_legacy_skip_does_not_become_retryable(self):
+        self.deferred_record()
+        journal = json.loads(self.path.read_text())
+        record = next(iter(journal["locates"].values()))
+        record.update(state="entry_expired")
+        record.pop("deferred_before_paid_send")
+        self.path.write_text(json.dumps(journal))
+        self.client = self.make_client()
+        with self.assertRaisesRegex(DasError, "already attempted") as error:
+            self.compare()
+        self.assertNotIsInstance(error.exception, LocateDeferred)
+        self.assertFalse(self.paid_commands())
+
+    def test_guard_failure_is_not_a_retryable_eligibility_denial(self):
+        def broken_guard():
+            raise RuntimeError("quote refresh failed")
+        with self.assertRaisesRegex(DasError, "Cannot verify entry eligibility") as error:
+            self.client.ensure_shortable("TEST", 100, .04, still_valid=broken_guard)
+        self.assertNotIsInstance(error.exception, LocateDeferred)
+        record = next(iter(json.loads(self.path.read_text())["locates"].values()))
+        self.assertNotEqual(record["state"], "entry_deferred")
+        self.assertFalse(self.paid_commands())
+
+    def test_deferred_journal_failure_is_not_retryable(self):
+        original = self.client._write_journal
+        def fail_deferred(journal):
+            if any(record.get("state") == "entry_deferred" for record in journal["locates"].values()):
+                raise OSError("disk unavailable")
+            original(journal)
+        with patch.object(self.client, "_write_journal", side_effect=fail_deferred):
+            with self.assertRaisesRegex(DasError, "Cannot persist") as error:
+                self.client.ensure_shortable("TEST", 100, .04, still_valid=lambda: False)
+        self.assertNotIsInstance(error.exception, LocateDeferred)
+        self.assertFalse(self.paid_commands())
+        self.client = self.make_client()
+        with self.assertRaisesRegex(DasError, "already attempted"):
+            self.compare()
+
+    def test_reject_transport_failure_does_not_mark_attempt_retryable(self):
+        # Let selection cleanup finish; fail only when the expired guard's
+        # cleanup rejects the previously retained winning offer.
+        self.client = self.make_client(locate_priced_only=False, locate_offer_only=True,
+                                       locate_quote_routes=())
+        def fail_winning_reject(command):
+            if command.endswith(" Reject"):
+                row = self.wire.locates[command.split()[1]]
+                if row["route"] == "LOCATE6":
+                    raise OSError("connection lost")
+        self.wire.sent_callback = fail_winning_reject
+        with self.assertRaisesRegex(DasError, "connection lost") as error:
+            self.client.ensure_shortable("TEST", 100, .04, still_valid=lambda: False)
+        self.assertNotIsInstance(error.exception, LocateDeferred)
+        record = next(iter(json.loads(self.path.read_text())["locates"].values()))
+        self.assertNotEqual(record["state"], "entry_deferred")
         self.assertFalse(self.paid_commands())
 
     def test_uncapped_purchase_intent_is_durable_before_wire(self):

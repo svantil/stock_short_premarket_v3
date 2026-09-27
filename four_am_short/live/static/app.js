@@ -45,7 +45,7 @@
   const pair = (main, sub, className = "") => `<span class="${className}">${esc(main)}</span><small>${esc(sub)}</small>`;
   const tag = (value) => {
     const label = readable(value);
-    const tone = /^(entered|open|filled|qualified|located|closed|ready|profit.target|available|selected|eligible)$/i.test(label) ? "positive" : /reject|error|fail|stop.loss/i.test(label) ? "negative" : /pending|waiting|locating|partial|stale|quote only/i.test(label) ? "caution" : "";
+    const tone = /^(entered|open|filled|qualified|located|closed|ready|profit.target|available|selected|eligible)$/i.test(label) ? "positive" : /reject|error|fail|stop.loss/i.test(label) ? "negative" : /pending|waiting|locating|deferred|partial|stale|quote only/i.test(label) ? "caution" : "";
     return `<span class="cell-tag ${tone}">${esc(label)}</span>`;
   };
   const empty = (columns, message) => `<tr><td colspan="${columns}" class="empty">${esc(message)}</td></tr>`;
@@ -83,7 +83,16 @@
     if (numeric(cost)) pieces.push(money(cost));
     if (numeric(locate.fee_per_share)) pieces.push(`${price(locate.fee_per_share)}/sh`);
     if (locate.route) pieces.push(locate.route);
-    return tag(locate.status || "requested") + `<small>${esc(pieces.join(" · ") || locate.note || "—")}</small>` + locateComparisons(locate.comparisons, comparisonKey);
+    const check = locate.eligibility;
+    const diagnostics = [];
+    if (check?.reason) {
+      if (check.checked_at) diagnostics.push(`Checked ${time(check.checked_at)} ET`);
+      if (numeric(check.bid)) diagnostics.push(`Bid ${price(check.bid)}`);
+      if (numeric(check.trigger_price)) diagnostics.push(`Trigger ${price(check.trigger_price)}`);
+      if (numeric(check.quote_age_seconds)) diagnostics.push(`Quote age ${Number(check.quote_age_seconds).toFixed(2)}s`);
+    }
+    return tag(locate.status || "requested") + `<small>${esc(pieces.join(" · ") || locate.note || "—")}</small>` +
+      (diagnostics.length ? `<small>${esc(diagnostics.join(" · "))}</small>` : "") + locateComparisons(locate.comparisons, comparisonKey);
   }
 
   function renderRules(raw = {}) {
@@ -91,6 +100,9 @@
     const shares = raw.shares ?? rules.shares;
     const reentry = rules.reentry || {};
     const reentryEnabled = raw.reentry_enabled ?? reentry.enabled ?? false;
+    const lateGaps = rules.late_gap_enabled === true;
+    const discoveryEnd = lateGaps ? rules.entry_deadline : rules.early_end;
+    const highReset = rules.repeated_high_policy === "first" ? "Within window: higher high resets wait" : "Within window: higher or equal high resets wait";
     const locateTrigger = raw.locate_trigger_below_entry_percent;
     const quoteRoutes = Array.isArray(raw.locate_quote_routes) ? raw.locate_quote_routes : [];
     $("locateRouteMode").classList.toggle("hidden", !quoteRoutes.length);
@@ -98,20 +110,24 @@
     const locateTiming = locateTrigger === null ? "Locate: after timing gates" : numeric(locateTrigger)
       ? Number(locateTrigger) === 0 ? "Locate: bid ≥ entry limit" : `Locate: bid ≥ entry − ${Number(locateTrigger)}%`
       : "Locate timing unavailable";
+    const entryPriceRange = numeric(rules.min_entry_price) && numeric(rules.max_entry_price)
+      ? `${price(rules.min_entry_price)}–${price(rules.max_entry_price)} inclusive`
+      : numeric(rules.min_entry_price) ? `≥ ${price(rules.min_entry_price)}`
+      : numeric(rules.max_entry_price) ? `≤ ${price(rules.max_entry_price)}` : "Unrestricted";
     const cards = [
-      ["01 / Find the gap", `>${has(rules.gap_percent) ? rules.gap_percent : "—"}%`, `${rules.early_start || "—"}–${rules.early_end || "—"} ET`],
-      ["02 / Wait for high", `${rules.wait_after_high_minutes ?? "—"} min`, "After high + window complete"],
-      ["03 / Short entry", `${rules.entry_below_high_percent ?? "—"}% below high`, `${num(shares)} shares · initial entry`, locateTiming],
+      ["01 / Find the gap", `>${has(rules.gap_percent) ? rules.gap_percent : "—"}%`, `${rules.early_start || "—"}–${discoveryEnd || "—"} ET · end excluded`, lateGaps ? "New stocks qualify throughout discovery" : "Early-window discovery"],
+      ["02 / Wait for high", `${rules.wait_after_high_minutes ?? "—"} min`, lateGaps ? `After high + window complete · late window: ${rules.late_gap_window_minutes ?? "—"} min from first gap` : "After high + window complete", `${highReset} · from ${rules.high_time_reference === "bar_start" ? "minute start" : "minute end"}`],
+      ["03 / Short entry", `${rules.entry_below_high_percent ?? "—"}% below high`, `${num(shares)} shares · initial entry`, locateTiming, `Price gate (both entries): ${entryPriceRange}`],
       ["04 / Entry deadline", rules.entry_deadline || "—", "Must fill before this time"],
       ["05 / Stop & target", `+${rules.stop_loss_percent ?? "—"}% / −${rules.profit_target_percent ?? "—"}%`, "From actual average entry"],
       ["06 / Time exit", rules.time_exit || "—", "Cover remaining shares"],
     ];
     cards.push(
-      ["07 / Re-entry", reentryEnabled ? "ON · after stop-loss" : "OFF", `${reentry.entry_above_high_percent ?? "—"}% above original early high`, "At most one · existing borrow only"],
+      ["07 / Re-entry", reentryEnabled ? "ON · after stop-loss" : "OFF", `${reentry.entry_above_high_percent ?? "—"}% above original setup high`, "At most one · existing borrow only"],
       ["08 / Re-entry stop & target", `+${reentry.stop_loss_percent ?? "—"}% / −${reentry.profit_target_percent ?? "—"}%`, "From actual re-entry fill", `${num(shares)} shares`],
       ["09 / Re-entry timing", `Enter < ${reentry.entry_deadline || "—"}`, `Cover remaining at ${reentry.time_exit || "—"} ET`, "After first position is fully stopped out"],
     );
-    $("ruleCards").innerHTML = cards.map(([label, value, description, detail], index) => `<article class="rule-card${index >= 6 ? " reentry-rule" : ""}"><span>${esc(label)}</span><strong>${esc(value)}</strong><small>${esc(description)}</small>${detail ? `<small>${esc(detail)}</small>` : ""}</article>`).join("");
+    $("ruleCards").innerHTML = cards.map(([label, value, ...details], index) => `<article class="rule-card${index >= 6 ? " reentry-rule" : ""}"><span>${esc(label)}</span><strong>${esc(value)}</strong>${details.filter(Boolean).map((detail) => `<small>${esc(detail)}</small>`).join("")}</article>`).join("");
     text("reentryStatus", reentryEnabled ? "One re-entry after a stop-loss · existing borrow only" : "Re-entry off");
   }
 
@@ -170,7 +186,7 @@
     if (data.error) issues.push(`SIP: ${data.error}`);
     if (state.running && !data.ready) issues.push("SIP data is not ready. New entries require healthy market data.");
     if (dasUnavailable && state.running) issues.push("DAS is not verified. New entries are blocked while the service reconnects. Existing orders may still fill at the broker; this service cannot manage positions or submit covers until DAS is available. Check any open exposure in DAS.");
-    if (state.running && data.backfill_ready === false) issues.push("Early-window history is still loading.");
+    if (state.running && data.backfill_ready === false) issues.push("Discovery history is still loading.");
     warning.classList.toggle("hidden", !issues.length);
     text("connectionWarning", issues.join(" "));
     text("candidateFooter", data.last_message ? `Last SIP message ${time(data.last_message)} ET` : "Awaiting market data");
@@ -191,7 +207,7 @@
       const gapPrice = numeric(gap) ? price(gap) : row.first_gap_time ? `>${price(threshold)}` : "—";
       const leg = Number(row.trade_number ?? 1) === 2 ? "Re-entry" : "Initial";
       return `<tr><td>${pair(row.symbol || "—", `Close ${price(row.previous_close)}`, "stock-symbol")}</td><td>${pair(gapPrice, time(row.first_gap_time))}</td><td>${pair(price(row.early_high), time(row.early_high_time))}</td><td>${pair(`${leg} ${price(row.entry_limit)}`, time(row.active_at))}</td><td>${pair(`${price(quote.bid)} / ${price(quote.ask)}`, age(quote.timestamp))}</td><td>${locateCell(row.locate, row.locate_trigger_price, `candidate:${row.symbol}:${leg}`)}</td><td>${tag(row.status)}<small class="cell-note">${esc(row.note || "")}</small></td></tr>`;
-    }).join("") : empty(7, filter || qualifiedOnly ? "No candidates match this filter." : "No early gap candidates yet. Start monitoring to discover stocks.");
+    }).join("") : empty(7, filter || qualifiedOnly ? "No candidates match this filter." : "No gap candidates yet. Start monitoring to discover stocks.");
   }
 
   function renderTrades() {

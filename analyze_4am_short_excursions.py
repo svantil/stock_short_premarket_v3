@@ -199,7 +199,7 @@ def markdown(summary: dict) -> str:
         f"Input SHA256: `{summary['provenance']['input_sha256']}`.", "",
         f"Found **{overall['stopped_initial_trades']} initial stop-outs**; reproduced {overall['valid_cached_replays']} from offline minute bars. "
         f"Unavailable or mismatching caches: {overall['unavailable_cached_replays']}.", "",
-        "All offsets are percentages above the original 04:00–04:15 Eastern high. The stop fill is known at the stop. "
+        "All offsets are percentages above the original setup-window high, from the early window or a late qualifier's fixed window. The stop fill is known at the stop. "
         "The next available minute's open is the first modeled re-entry opportunity. Future maximums use bars after the stop minute and strictly before the cutoff. "
         "The stop minute's high is recorded separately because its order relative to the stop cannot be inferred.", "",
         "| Period | Cutoff | Eligible observed | Avg next open | Median next open | Avg future max | Median future max | Future max P75 | Future max P90 | Max |",

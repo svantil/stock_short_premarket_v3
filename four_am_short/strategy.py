@@ -3,6 +3,8 @@
 Bars label the beginning of their minute. The early window is [start, end),
 and an early high is timestamped at the bar's end by default, so the requested
 wait has certainly elapsed. Repeated highs restart that wait by default.
+When late-gap discovery is enabled, stocks first qualifying after the early
+window get their own fixed observation window and the same high-based delay.
 
 OHLC bars do not reveal the order of their high and low. We evaluate both
 open-high-low-close and open-low-high-close paths. The conservative policy
@@ -34,6 +36,8 @@ from zoneinfo import ZoneInfo
 
 from .config import StrategyConfig
 from .models import Bar, DataError, PreviousClose, TradeResult
+from .pricing import order_price
+from .setups import select_setup
 
 
 EASTERN = ZoneInfo("America/New_York")
@@ -72,6 +76,18 @@ def _price_percent(price: float, percent: float, sign: int) -> float:
 
 def _entry_fill(price: float, limit: float, config: StrategyConfig) -> float:
     return max(limit, price * (1 - config.entry_slippage_bps / 10_000))
+
+
+def _entry_bar_out_of_range(bar: Bar, limit: float, config: StrategyConfig) -> bool:
+    """Reject an out-of-range modeled fill without inventing a capped price.
+
+    If an opening fill is ineligible, skip its entire minute. A later minute
+    may still fill before the deadline; OHLC data cannot establish a fresh
+    eligibility check and order submission within the rejected minute.
+    """
+    return bar.high >= limit and not config.entry_price_allowed(
+        _entry_fill(max(bar.open, limit), limit, config)
+    )
 
 
 def _buy_fill(price: float, config: StrategyConfig) -> float:
@@ -234,29 +250,39 @@ def simulate(
             f" Previous close split-normalized: source={previous_close.source_close},"
             f" factor={previous_close.split_factor}, normalized={previous_close.close}."
         )
-    early = [bar for bar in ordered if start <= _stamp(bar) < end]
+    scan_end = deadline if config.late_gap_enabled else end
+    early = [bar for bar in ordered if start <= _stamp(bar) < scan_end]
     if not early:
-        result.reason = "no_early_bars"
+        result.reason = "no_premarket_bars" if config.late_gap_enabled else "no_early_bars"
         return result
 
-    high = max(bar.high for bar in early)
-    high_bars = [bar for bar in early if bar.high == high]
-    high_bar = high_bars[-1] if config.repeated_high_policy == "last" else high_bars[0]
-    high_stamp = _stamp(high_bar)
-    if config.high_time_reference == "bar_end":
-        high_stamp += ONE_MINUTE
+    setup = select_setup(day, ordered, previous_close.close, config)
+    if setup is None:
+        high = max(bar.high for bar in early)
+        high_bars = [bar for bar in early if bar.high == high]
+        high_bar = high_bars[-1] if config.repeated_high_policy == "last" else high_bars[0]
+        high_stamp = _stamp(high_bar)
+        if config.high_time_reference == "bar_end":
+            high_stamp += ONE_MINUTE
+    else:
+        high_bar, high_stamp = setup.high_bar, setup.high_time
+        high = high_bar.high
     result.early_high = high
     result.early_high_bar_time = _stamp(high_bar).isoformat()
     result.early_high_time = high_stamp.isoformat()
-    crossings = [bar for bar in early if Decimal(str(bar.high)) > threshold_decimal]
-    if not crossings:
+    if setup is None:
         result.reason = "gap_threshold_not_exceeded"
         return result
-    result.first_gap_time = _stamp(crossings[0]).isoformat()
-    result.first_gap_bar_high = crossings[0].high
+    result.first_gap_time = _stamp(setup.first_gap_bar).isoformat()
+    result.first_gap_bar_high = setup.first_gap_bar.high
+    if setup.late_gap:
+        result.notes += (
+            f" Late gap: high measured in the {config.late_gap_window_minutes}-minute"
+            " window starting at the first qualifying bar, then frozen."
+        )
 
-    activation = max(end, high_stamp + timedelta(minutes=config.wait_after_high_minutes))
-    limit = _price_percent(high, config.entry_below_high_percent, -1)
+    activation = setup.active_at
+    limit = order_price(_price_percent(high, config.entry_below_high_percent, -1))
     result.order_active_time = activation.isoformat()
     result.entry_limit = limit
     return _simulate_order(result, ordered, activation, deadline, cutoff, limit, config)
@@ -272,10 +298,14 @@ def _simulate_order(
     config: StrategyConfig,
 ) -> TradeResult:
     """Apply common entry/exit fills to one independently identified attempt."""
+    if not config.entry_price_allowed(limit):
+        result.reason = "entry_price_out_of_range"
+        return result
     if activation >= deadline:
         result.reason = "activation_at_or_after_deadline"
         return result
 
+    rejected_entry_price = False
     for bar in ordered:
         stamp = _stamp(bar)
         if stamp < activation:
@@ -292,6 +322,9 @@ def _simulate_order(
                 )
             break
 
+        if result.entry_price is None and _entry_bar_out_of_range(bar, limit, config):
+            rejected_entry_price = True
+            continue
         ohlc = _path(bar, "ohlc", result.entry_price, limit, config)
         olhc = _path(bar, "olhc", result.entry_price, limit, config)
         if ohlc != olhc:
@@ -303,7 +336,10 @@ def _simulate_order(
             return _record_exit(result, chosen.exit_price, chosen.exit_reason, stamp, config)
 
     if result.entry_price is None:
-        result.reason = "entry_not_filled_before_deadline"
+        result.reason = (
+            "entry_price_out_of_range" if rejected_entry_price
+            else "entry_not_filled_before_deadline"
+        )
     else:
         result.status = "incomplete"
         result.reason = "missing_time_exit_bar"
@@ -333,7 +369,7 @@ def simulate_trades(
 
     assert initial.early_high is not None
     activation = datetime.fromisoformat(initial.exit_time).astimezone(EASTERN) + ONE_MINUTE
-    limit = _price_percent(initial.early_high, config.reentry.entry_above_high_percent, 1)
+    limit = order_price(_price_percent(initial.early_high, config.reentry.entry_above_high_percent, 1))
     result = TradeResult(
         date=initial.date,
         symbol=initial.symbol,

@@ -47,7 +47,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         # These tests never start a supervisor or real client. Close store and
         # await any recovery tasks so no background worker escapes the test.
         self.engine.running = False
-        for task in (self.engine._bootstrap_task, self.engine._finalize_task, self.engine._entry_task):
+        for task in (self.engine._bootstrap_task, self.engine._finalize_task, self.engine._late_finalize_task, self.engine._entry_task):
             if task:
                 if not task.done():
                     task.cancel()
@@ -213,6 +213,261 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         trade = self.engine._trades()[0]
         self.assertEqual(trade["status"], "skipped")
         self.assertEqual(trade["entry_filled_qty"], 0)
+
+    def enable_late_gaps(self, clock="07:30"):
+        self.clock = instant(clock)
+        self.engine.settings = replace(self.engine.settings, strategy=replace(
+            self.engine.settings.strategy, late_gap_enabled=True, entry_deadline="09:00"))
+        self.engine._closes = {"TEST": 10}
+        self.engine._symbols = ["TEST"]
+        self.engine.running = self.engine.entries_enabled = True
+        self.engine._market_day = self.engine._window_finalized = True
+        self.engine._data_status.update(ready=True, backfill_ready=True)
+
+    async def test_later_gap_uses_high_delay_after_early_window_finalizes(self):
+        self.enable_late_gaps("07:10")
+        self.engine._accept_bar("TEST", bar("07:00", 14))
+        candidate = self.engine._day_state()["candidates"]["TEST"]
+        self.assertTrue(candidate["late_gap"])
+        self.assertEqual(candidate["active_at"], instant("07:15").isoformat())
+        self.assertEqual(candidate["window_end"], instant("07:15").isoformat())
+        await self.quote(12.8, 12.9)
+        self.assertFalse(self.engine._can_enter(candidate))
+        self.clock = instant("07:15:34")
+        self.data.backfill.return_value = {"TEST": [bar("07:00", 14)]}
+        await self.engine._finalize_late_windows()
+        self.data.backfill.assert_not_awaited()
+        self.assertFalse(self.engine._can_enter(candidate))
+        self.clock = instant("07:15:35")
+        await self.engine._finalize_late_windows()
+        self.data.backfill.assert_awaited_with(["TEST"], date(2026, 9, 21), "07:00", "07:15")
+        candidate = self.engine._day_state()["candidates"]["TEST"]
+        await self.quote(12.8, 12.9)
+        self.assertTrue(self.engine._can_enter(candidate))
+        await self.engine._enter(candidate)
+        trade = self.engine._day_state()["trades"]["TEST"]
+        self.assertEqual(trade["entry_limit"], 12.6)
+        self.assertEqual(trade["entry_avg_price"], 12.8)
+        self.assertEqual(trade["stop_price"], 16.64)
+        self.assertEqual(trade["target_price"], 11.2)
+        self.engine._accept_bar("TEST", bar("07:14", 25))
+        self.assertEqual(trade["early_high"], 14)
+        self.assertEqual(trade["entry_limit"], 12.6)
+        self.assertEqual(self.engine._day_state()["candidates"]["TEST"]["early_high"], 14)
+
+    async def test_later_fresh_and_repeated_highs_set_delay_within_fixed_window(self):
+        self.enable_late_gaps()
+        for clock, high in (("07:00", 14), ("07:08", 15), ("07:12", 15)):
+            self.engine._accept_bar("TEST", bar(clock, high))
+        candidate = self.engine._day_state()["candidates"]["TEST"]
+        self.assertEqual(candidate["early_high"], 15)
+        self.assertEqual(candidate["active_at"], instant("07:23").isoformat())
+        self.assertEqual(candidate["window_end"], instant("07:15").isoformat())
+        self.engine._accept_bar("TEST", bar("07:23", 25))
+        candidate = self.engine._day_state()["candidates"]["TEST"]
+        self.assertEqual(candidate["early_high"], 15)
+        self.assertEqual(candidate["entry_limit"], 13.5)
+        self.assertEqual(candidate["active_at"], instant("07:23").isoformat())
+
+    async def test_later_gap_cannot_enter_using_replaced_candidate(self):
+        self.enable_late_gaps("07:15")
+        self.engine._accept_bar("TEST", bar("07:00", 14))
+        stale = self.engine._day_state()["candidates"]["TEST"]
+        self.engine._accept_bar("TEST", bar("07:08", 15))
+        await self.quote(14, 14.1)
+        self.assertFalse(self.engine._can_enter(stale))
+        await self.engine._enter(stale)
+        self.assertEqual(self.engine._day_state()["trades"], {})
+
+    async def test_later_scanning_keeps_original_early_setup(self):
+        self.enable_late_gaps()
+        self.engine._accept_bar("TEST", bar("04:05", 14), historical=True)
+        self.engine._accept_bar("TEST", bar("07:00", 25))
+        candidate = self.engine._day_state()["candidates"]["TEST"]
+        self.assertFalse(candidate["late_gap"])
+        self.assertEqual(candidate["early_high"], 14)
+        self.assertEqual(candidate["active_at"], instant("04:16").isoformat())
+
+    async def test_later_backfill_finds_faded_gap_and_replaces_stale_history(self):
+        self.enable_late_gaps()
+        self.engine._accept_bar("TEST", bar("05:00", 40))
+        self.data.backfill.return_value = {"TEST": [bar("07:00", 14), bar("07:20", 11)]}
+        await self.engine._bootstrap()
+        self.data.backfill.assert_awaited_with(["TEST"], date(2026, 9, 21), "04:00", "07:30")
+        candidate = self.engine._day_state()["candidates"]["TEST"]
+        self.assertEqual(candidate["first_gap_time"], instant("07:00").isoformat())
+        self.assertEqual(candidate["early_high"], 14)
+        self.assertTrue(self.engine._window_finalized)
+        self.assertTrue(candidate["window_finalized"])
+
+    async def test_later_backfill_preserves_new_websocket_minutes(self):
+        self.enable_late_gaps()
+        async def delayed(*args):
+            self.clock = instant("07:31")
+            self.engine._accept_bar("TEST", bar("07:30", 14))
+            return {}
+        self.data.backfill.side_effect = delayed
+        await self.engine._bootstrap()
+        candidate = self.engine._day_state()["candidates"]["TEST"]
+        self.assertEqual(candidate["first_gap_time"], instant("07:30").isoformat())
+
+    async def test_early_finalizer_preserves_later_candidates(self):
+        self.enable_late_gaps()
+        self.engine._accept_bar("TEST", bar("07:00", 14))
+        self.data.backfill.return_value = {}
+        await self.engine._finalize_window()
+        candidate = self.engine._day_state()["candidates"]["TEST"]
+        self.assertEqual(candidate["first_gap_time"], instant("07:00").isoformat())
+        self.assertEqual(candidate["active_at"], instant("07:15").isoformat())
+
+    async def test_later_gap_does_not_extend_exclusive_entry_deadline(self):
+        self.enable_late_gaps("09:01")
+        self.engine._accept_bar("TEST", bar("09:00", 14))
+        self.assertNotIn("TEST", self.engine._day_state()["candidates"])
+        self.engine._accept_bar("TEST", bar("08:55", 14))
+        candidate = self.engine._day_state()["candidates"]["TEST"]
+        self.assertEqual(candidate["active_at"], instant("09:10").isoformat())
+        await self.quote(13, 13.1)
+        self.assertFalse(self.engine._can_enter(candidate))
+        await self.engine.tick()
+        self.assertEqual(candidate["status"], "expired")
+
+    async def test_later_window_rest_correction_sets_high_before_freezing(self):
+        self.enable_late_gaps("07:16")
+        self.engine._accept_bar("TEST", bar("07:00", 14))
+        self.data.backfill.return_value = {"TEST": [bar("07:00", 14), bar("07:14", 20)]}
+        await self.engine._finalize_late_windows()
+        candidate = self.engine._day_state()["candidates"]["TEST"]
+        self.assertTrue(candidate["window_finalized"])
+        self.assertEqual(candidate["early_high"], 20)
+        self.assertEqual(candidate["active_at"], instant("07:25").isoformat())
+        self.engine._accept_bar("TEST", bar("07:14", 25))
+        self.assertEqual(candidate["early_high"], 20)
+        self.data.backfill.return_value = {}
+        await self.engine._finalize_window()
+        self.assertFalse(self.engine._day_state()["candidates"]["TEST"]["window_finalized"])
+        self.data.backfill.return_value = {"TEST": [bar("07:00", 14), bar("07:14", 20)]}
+        await self.engine._finalize_late_windows()
+        self.assertTrue(self.engine._day_state()["candidates"]["TEST"]["window_finalized"])
+        self.assertEqual(self.engine._day_state()["candidates"]["TEST"]["early_high"], 20)
+
+    async def test_later_window_correction_restarts_window_if_first_gap_moves(self):
+        self.enable_late_gaps("07:16")
+        self.engine._accept_bar("TEST", bar("07:00", 14))
+        self.data.backfill.return_value = {"TEST": [bar("07:00", 12), bar("07:05", 15)]}
+        await self.engine._finalize_late_windows()
+        candidate = self.engine._day_state()["candidates"]["TEST"]
+        self.assertEqual(candidate["first_gap_time"], instant("07:05").isoformat())
+        self.assertEqual(candidate["window_end"], instant("07:20").isoformat())
+        self.assertFalse(candidate["window_finalized"])
+
+    async def test_later_window_failure_retries_without_allowing_entry(self):
+        self.enable_late_gaps("07:16")
+        self.engine._accept_bar("TEST", bar("07:00", 14))
+        self.data.backfill.side_effect = [RuntimeError("temporary"), {"TEST": [bar("07:00", 14)]}]
+        await self.engine._finalize_late_windows()
+        candidate = self.engine._day_state()["candidates"]["TEST"]
+        await self.quote(13, 13.1)
+        self.assertFalse(self.engine._can_enter(candidate))
+        await self.engine.tick()
+        self.assertIsNone(self.engine._late_finalize_task)
+        self.clock += timedelta(seconds=6)
+        await self.engine.tick()
+        await self.engine._late_finalize_task
+        self.assertTrue(self.engine._day_state()["candidates"]["TEST"]["window_finalized"])
+
+    async def test_bootstrap_request_before_correction_delay_cannot_finalize_late_window(self):
+        self.enable_late_gaps("07:15")
+        async def delayed(*args):
+            self.clock = instant("07:15:40")
+            return {"TEST": [bar("07:00", 14)]}
+        self.data.backfill.side_effect = delayed
+        await self.engine._bootstrap()
+        candidate = self.engine._day_state()["candidates"]["TEST"]
+        self.assertFalse(candidate["window_finalized"])
+        await self.quote(13, 13.1)
+        self.assertFalse(self.engine._can_enter(candidate))
+
+    async def test_later_window_shift_to_earlier_gap_needs_full_rest_coverage(self):
+        self.enable_late_gaps("07:16")
+        self.engine._accept_bar("TEST", bar("07:00", 14))
+        async def delayed(*args):
+            self.engine._accept_bar("TEST", bar("06:55", 15))
+            return {"TEST": [bar("07:00", 14)]}
+        self.data.backfill.side_effect = delayed
+        await self.engine._finalize_late_windows()
+        candidate = self.engine._day_state()["candidates"]["TEST"]
+        self.assertEqual(candidate["first_gap_time"], instant("06:55").isoformat())
+        self.assertEqual(candidate["window_end"], instant("07:10").isoformat())
+        self.assertFalse(candidate["window_finalized"])
+
+    async def test_stale_finalized_late_candidate_cannot_bypass_current_readiness(self):
+        self.enable_late_gaps("07:16")
+        self.data.backfill.return_value = {"TEST": [bar("07:00", 14)]}
+        await self.engine._bootstrap()
+        stale = self.engine._day_state()["candidates"]["TEST"]
+        self.assertTrue(stale["window_finalized"])
+        self.engine._day_state()["candidates"]["TEST"] = {**stale, "window_finalized": False}
+        await self.quote(13, 13.1)
+        self.assertFalse(self.engine._can_enter(stale))
+
+    async def test_two_later_stocks_have_independent_windows_and_frozen_trades(self):
+        self.enable_late_gaps("07:16")
+        self.engine._symbols.append("NEXT")
+        self.engine._closes["NEXT"] = 10
+        self.engine._accept_bar("TEST", bar("07:00", 14))
+        self.engine._accept_bar("NEXT", bar("07:10", 15))
+        self.data.backfill.return_value = {"TEST": [bar("07:00", 14)]}
+        await self.engine._finalize_late_windows()
+        self.data.backfill.assert_awaited_once_with(["TEST"], date(2026, 9, 21), "07:00", "07:15")
+        first, second = (self.engine._day_state()["candidates"][symbol] for symbol in ("TEST", "NEXT"))
+        self.assertTrue(first["window_finalized"])
+        self.assertFalse(second["window_finalized"])
+        self.assertEqual(second["window_end"], instant("07:25").isoformat())
+        await self.quote(12.8, 12.9)
+        await self.engine.on_event({"T": "q", "S": "NEXT", "bp": 14, "ap": 14.1,
+                                    "bs": 1, "as": 1, "t": self.clock.isoformat()})
+        self.assertTrue(self.engine._can_enter(first))
+        self.assertFalse(self.engine._can_enter(second))
+        await self.engine._enter(first)
+        await self.engine._enter(second)
+        self.assertEqual(set(self.engine._day_state()["trades"]), {"TEST"})
+        self.engine._accept_bar("TEST", bar("07:14", 25))
+        self.engine._accept_bar("NEXT", bar("07:15", 16))
+        self.assertEqual(self.engine._day_state()["trades"]["TEST"]["early_high"], 14)
+        self.assertEqual(self.engine._day_state()["candidates"]["NEXT"]["early_high"], 16)
+
+    async def test_later_entry_waits_for_authoritative_original_window(self):
+        self.enable_late_gaps("07:16")
+        self.engine._window_finalized = False
+        self.engine._accept_bar("TEST", bar("07:00", 14))
+        self.data.backfill.return_value = {"TEST": [bar("07:00", 14)]}
+        await self.engine._finalize_late_windows()
+        candidate = self.engine._day_state()["candidates"]["TEST"]
+        self.assertTrue(candidate["window_finalized"])
+        await self.quote(13, 13.1)
+        self.assertFalse(self.engine._can_enter(candidate))
+        await self.engine._enter(candidate)
+        self.assertEqual(self.engine._day_state()["trades"], {})
+
+    async def test_recovered_early_qualifier_reclassifies_unconsumed_late_setup(self):
+        self.enable_late_gaps("07:16")
+        self.engine._accept_bar("TEST", bar("07:00", 14))
+        self.data.backfill.return_value = {"TEST": [bar("07:00", 14)]}
+        await self.engine._finalize_late_windows()
+        late = self.engine._day_state()["candidates"]["TEST"]
+        self.assertTrue(late["window_finalized"])
+        self.engine._window_finalized = False
+        self.data.backfill.return_value = {"TEST": [bar("04:14", 20)]}
+        await self.engine._finalize_window()
+        candidate = self.engine._day_state()["candidates"]["TEST"]
+        self.assertFalse(candidate["late_gap"])
+        self.assertEqual(candidate["first_gap_time"], instant("04:14").isoformat())
+        self.assertEqual(candidate["early_high"], 20)
+        self.assertEqual(candidate["active_at"], instant("04:25").isoformat())
+        await self.quote(19, 19.1)
+        self.assertTrue(self.engine._can_enter(candidate))
+        self.assertFalse(self.engine._can_enter(late))
 
 
 class ConfigurationAndStoreTests(unittest.TestCase):

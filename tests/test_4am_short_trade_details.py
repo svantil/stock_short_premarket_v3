@@ -104,6 +104,47 @@ class TradeDetailsTests(unittest.TestCase):
         self.assertIn("entry strictly before 6:00 AM EDT", text)
         self.assertNotIn("UTC", text)
 
+    def test_late_setup_describes_its_own_fixed_window_and_high(self):
+        result = completed_trade(
+            first_gap_time="2026-01-05T07:00:00-05:00",
+            early_high_bar_time="2026-01-05T07:14:00-05:00",
+            early_high_time="2026-01-05T07:15:00-05:00",
+            order_active_time="2026-01-05T07:25:00-05:00",
+            entry_time="2026-01-05T07:25:00-05:00",
+            exit_time="2026-01-05T07:30:00-05:00",
+        )
+        config = StrategyConfig(late_gap_enabled=True, entry_deadline="09:00")
+        text = format_candidate(result, config)
+        self.assertIn("Discovery window: 4:00 AM EST to 9:00 AM EST (end excluded)", text)
+        self.assertIn("Late setup window: 7:00 AM EST to 7:15 AM EST (end excluded)", text)
+        self.assertIn("Late setup high: $20.00; source bar 7:14 AM EST", text)
+        self.assertIn("Wait reference: 7:15 AM EST (bar end); wait 10 minutes", text)
+        self.assertIn("Sell limit: $18.00 (10% below late setup high)", text)
+        self.assertIn("Order active: 7:25 AM EST; entry strictly before 9:00 AM EST", text)
+        self.assertNotIn("Early window:", text)
+        self.assertNotIn("Early high:", text)
+
+    def test_late_setup_uses_configured_window_and_eastern_first_gap_boundary(self):
+        config = StrategyConfig(late_gap_enabled=True, late_gap_window_minutes=20, entry_deadline="09:00")
+        result = completed_trade(date="2026-06-01", first_gap_time="2026-06-01T08:15:00+00:00")
+        text = format_candidate(result, config)
+        self.assertIn("Late setup window: 4:15 AM EDT to 4:35 AM EDT (end excluded)", text)
+        self.assertIn("Late setup high:", text)
+        early = replace(result, first_gap_time="2026-06-01T08:14:00+00:00")
+        early_text = format_candidate(early, config)
+        self.assertIn("Early window: 4:00 AM EDT to 4:15 AM EDT", early_text)
+        self.assertIn("Early high:", early_text)
+        self.assertNotIn("Late setup high:", early_text)
+
+    def test_reentry_keeps_late_setup_high_and_its_separate_deadline(self):
+        config = StrategyConfig(late_gap_enabled=True, entry_deadline="09:00")
+        config = replace(config, reentry=replace(config.reentry, enabled=True, entry_deadline="08:00"))
+        result = completed_trade(trade_number=2, first_gap_time="2026-01-05T07:00:00-05:00")
+        text = format_candidate(result, config)
+        self.assertIn("original late setup high is retained", text)
+        self.assertIn("5% above late setup high", text)
+        self.assertIn("entry strictly before 8:00 AM EST", text)
+
 
 if __name__ == "__main__":
     unittest.main()

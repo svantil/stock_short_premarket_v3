@@ -6,7 +6,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from four_am_short.live.config import DasSettings
-from four_am_short.live.das import DasClient, DasError, OrderRejected, OrderSubmissionUncertain
+from four_am_short.live.das import DasClient, DasError, LocateDeferred, OrderRejected, OrderSubmissionUncertain
 
 
 def order_line(oid='20', token='456', side='SS', qty=100, leaves=100, canceled=0,
@@ -289,15 +289,22 @@ class DasTests(unittest.TestCase):
         with self.assertRaisesRegex(DasError, 'unconfirmed'): self.client.ensure_shortable('TEST', 100, .04)
         self.assertEqual(len(self.paid_commands()), 1)
     def test_entry_deadline_blocks_paid_locate(self):
-        with self.assertRaisesRegex(DasError, 'eligibility expired'):
+        with self.assertRaisesRegex(LocateDeferred, 'eligibility expired'):
             self.client.ensure_shortable('TEST', 100, .04, still_valid=lambda: False)
         self.assertFalse(self.paid_commands())
+        record = next(iter(json.loads(self.path.read_text())['locates'].values()))
+        self.assertEqual(record['state'], 'entry_deferred')
+        self.assertTrue(record['deferred_before_paid_send'])
     def test_pause_after_intent_before_acceptance(self):
         self.wire.minimums['LOCATE10'] = '9'
         checks = iter([True, False])
-        with self.assertRaisesRegex(DasError, 'eligibility expired'):
+        with self.assertRaisesRegex(LocateDeferred, 'eligibility expired'):
             self.client.ensure_shortable('TEST', 100, .04, still_valid=lambda: next(checks))
         self.assertFalse(self.paid_commands())
+        record = next(iter(json.loads(self.path.read_text())['locates'].values()))
+        self.assertEqual(record['state'], 'entry_deferred')
+        self.assertTrue(all(request['phase'] in {'never_accept', 'quote_only'}
+                            for request in record['requests']))
     def test_unowned_pending_locate_blocks(self):
         self.wire.locates['99'] = dict(id='99', qty=100, route='LOCATE4', token='777',
                                       price='0.02', status='Pending', open=100, filled=0)

@@ -112,7 +112,7 @@ def gap_not_traded_reasons(rows: list[TradeResult]) -> dict[str, int]:
 
 
 def format_gap_summary(rows: list[TradeResult], config: StrategyConfig, *, partial: bool = False) -> str:
-    """Show how confirmed early-gap setups converted into actual short entries."""
+    """Show how confirmed gap setups converted into actual short entries."""
     headers = ("Month", "Gap Triggers", "Traded", "Not Traded", "Traded%")
     overall = summarize(rows)
 
@@ -130,9 +130,10 @@ def format_gap_summary(rows: list[TradeResult], config: StrategyConfig, *, parti
                          for index, value in enumerate(row))
 
     separator = "  ".join("-" * width for width in widths)
+    discovery_end = config.entry_deadline if config.late_gap_enabled else config.early_end
     lines = [
         f"Gap-to-trade summary - {STRATEGY_NAME}" + (" (PARTIAL)" if partial else ""),
-        f"Confirmed move >{config.gap_percent:g}% above the prior regular close during {config.early_start} <= time < {config.early_end} Eastern.",
+        f"Confirmed move >{config.gap_percent:g}% above the prior regular close during {config.early_start} <= time < {discovery_end} Eastern.",
         "Each stock/date counts as one setup. Traded means the first entry filled, including unresolved exits; re-entries do not add gap triggers.",
         line(headers), separator, *(line(row) for row in values), separator, line(total),
         f"Entered results: {overall['gap_completed']:,} completed; {overall['gap_unresolved']:,} unresolved exits.",
@@ -148,11 +149,12 @@ def format_gap_summary(rows: list[TradeResult], config: StrategyConfig, *, parti
                      for reason, count in reasons.items())
     unconfirmed = [row for row in rows if row.trade_number == 1 and not row.first_gap_time]
     if unconfirmed:
-        no_early = sum(row.reason == "no_early_bars" for row in unconfirmed)
+        no_early = sum(row.reason in {"no_early_bars", "no_premarket_bars"} for row in unconfirmed)
         below = sum(row.reason == "gap_threshold_not_exceeded" for row in unconfirmed)
         unavailable = sum(row.status in {"error", "incomplete"} for row in unconfirmed)
+        missing_bars = "no discovery bars" if config.late_gap_enabled else "no early bars"
         lines.append(f"Other processed candidates without a confirmed trigger: {len(unconfirmed):,} "
-                     f"({below:,} below threshold; {no_early:,} no early bars; {unavailable:,} errors/incomplete).")
+                     f"({below:,} below threshold; {no_early:,} {missing_bars}; {unavailable:,} errors/incomplete).")
         if unavailable:
             lines.append("Errors/incomplete results do not establish whether the gap rule was met.")
     return "\n".join(lines)
@@ -264,7 +266,7 @@ def write_reports(config: BacktestConfig, rows: list[TradeResult], *, requested_
     write_csv(report_path("trades.csv"), [row for row in all_rows if row["status"] == "trade"], columns)
     details_header = (
         f"{STRATEGY_NAME} backtest - all times Eastern (America/New_York)\n"
-        "Times identify one-minute bars, not exact trade ticks. The early-high wait reference is shown separately.\n\n"
+        "Times identify one-minute bars, not exact trade ticks. The setup-high wait reference is shown separately.\n\n"
     )
     candidate_indices = {key: index for index, key in enumerate(
         dict.fromkeys((row.date, row.symbol) for row in rows if row.trade_number == 1), 1)}
@@ -303,6 +305,9 @@ def write_reports(config: BacktestConfig, rows: list[TradeResult], *, requested_
             "time_precision": "Intrabar fills carry the bar-start timestamp, not an observed execution timestamp.",
             "high_time_reference": config.strategy.high_time_reference,
             "repeated_high_policy": config.strategy.repeated_high_policy,
+            "late_gap_enabled": config.strategy.late_gap_enabled,
+            "late_gap_window_minutes": config.strategy.late_gap_window_minutes,
+            "setup_high": "Original early-window qualifiers retain their early-window high. When late gaps are enabled, new qualifiers after the early window use a fixed late_gap_window_minutes window from the first qualifying minute and freeze its high. Entry waits for both window completion and the high-based delay. The early_high fields retain the setup high for both paths.",
             "intrabar_policy": config.strategy.intrabar_policy,
             "liquidity": "Full-size fills assumed; quotes, queue, borrow availability and volume limits are not modeled.",
             "costs": "Configured locate fee charged once on the first filled trade; re-entry reuses those shares with no second locate fee. Per-side commissions apply to both trades. Actual locate charges for unfilled orders are not modeled.",
@@ -311,7 +316,7 @@ def write_reports(config: BacktestConfig, rows: list[TradeResult], *, requested_
             "day_outcomes": "Winning and losing days use combined net P/L of completed trades on each Eastern trading date; breakeven days count separately.",
             "gap_funnel": "Counts only trade_number=1: confirmed triggers have first_gap_time; traded triggers have an entry_price, including unresolved positions. Re-entries do not duplicate stock/date setup counts.",
             "stops": "Total completed trades with a stop_loss exit in the period; each stopped initial or re-entry trade counts separately.",
-            "reentry": "At most one re-entry after a completed first stop-loss, using the original early high. Earliest backtest activation is the next minute after the stop bar because intrabar event timing is unknown. Live entries may activate as soon as the stop is fully filled and confirmed flat. Existing borrow reuse is assumed in the backtest; live checks DAS availability and never purchases new locates for re-entry.",
+            "reentry": "At most one re-entry after a completed first stop-loss, using the original setup high. Earliest backtest activation is the next minute after the stop bar because intrabar event timing is unknown. Live entries may activate as soon as the stop is fully filled and confirmed flat. Existing borrow reuse is assumed in the backtest; live checks DAS availability and never purchases new locates for re-entry.",
         },
     }
     if config.strategy.reentry.enabled:

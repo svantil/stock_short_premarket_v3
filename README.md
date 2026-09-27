@@ -1,6 +1,6 @@
 # 4am short
 
-**4am short** (`strategy_id: 4am_short`) includes a Python backtest, a local dashboard, and a live supervisor for the 04:00–04:15 Eastern gap-and-pullback short setup. Backtests use a dated stock list and Massive historical data. Live discovery and quotes use Alpaca's live SIP websocket; locates, orders, and fills use the DAS Trader Pro CMD API. This directory is independent of `stock_short_premarket_v2` and imports no v2 code.
+**4am short** (`strategy_id: 4am_short`) includes a Python backtest, a local dashboard, and a live supervisor for a premarket gap-and-pullback short setup. The supplied configuration keeps the original 04:00–04:15 Eastern setup and also discovers new qualifying stocks until 09:00. Backtests use a dated stock list and Massive historical data. Live discovery and quotes use Alpaca's live SIP websocket; locates, orders, and fills use the DAS Trader Pro CMD API. This directory is independent of `stock_short_premarket_v2` and imports no v2 code.
 
 Live mode defaults to **monitor**, which simulates entries/exits from live quotes without sending locates or orders. The implementation has been checked with synthetic data and mock broker responses; an actual Alpaca SIP entitlement and the broker's DAS CMD session have not been exercised by these tests.
 
@@ -60,6 +60,13 @@ Use `--offline` to rerun entirely from the local cache; missing cache entries be
 
 Candidates whose configured time-exit minute has not yet finished are marked `incomplete` with reason `session_not_finished`, without fetching their prices. The run can still process earlier dates.
 
+Today's candidates are supported online, including Massive responses with status `DELAYED`. Today's minute bars are fetched fresh on every run and are never cached, so `--offline` only works for completed historical dates. Wait until the latest enabled time-exit minute has finished **and your data feed has caught up** before running today. With the supplied 09:20 Eastern exits, that means after 09:21 on a real-time feed or approximately 09:36 on a 15-minute delayed feed; earlier delayed results can be incomplete or skip setups whose bars have not arrived yet.
+
+```sh
+# Run only today's candidates (example date).
+python3 backtest_4am_short.py --from-date 2026-09-23 --to-date 2026-09-23
+```
+
 ## Run the dashboard and live supervisor
 
 Install the live dependencies into the v3 virtual environment:
@@ -83,7 +90,7 @@ Open the local address printed by the launcher (the supplied live JSON uses **ht
 
 Set `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` in v3's `.env`. The feed is `wss://stream.data.alpaca.markets/v2/sip`, with no IEX or delayed-feed fallback. Alpaca supplies market data only; the implementation never sends orders through Alpaca. Existing environment variables override `.env` values.
 
-`live_4am_short.json` selects `backtest_4am_short.json` through `strategy_config`. Both use its **shares, percentages, early window, high-time convention, entry deadline, and time exit**, including the optional re-entry rules. `execution.reentry_enabled` independently switches live re-entry on or off; see [Optional re-entry](#optional-re-entry-after-a-stop-loss). Changes take effect when the live process restarts. The strategy table below lists code defaults; the current JSON may override them, including the entry deadline. The dashboard's rule cards and launcher output show the active values.
+`live_4am_short.json` selects `backtest_4am_short.json` through `strategy_config`. Both use its **shares, percentages, entry price bounds, early window, late-gap discovery and window settings, high-time convention, entry deadline, and time exit**, including the optional re-entry rules. `execution.reentry_enabled` independently switches live re-entry on or off; see [Optional re-entry](#optional-re-entry-after-a-stop-loss). Changes take effect when the live process restarts. The strategy table below lists code defaults; the current JSON may override them, including the entry deadline. The dashboard's rule cards and launcher output show the active values.
 
 | `mode` | Behavior |
 | --- | --- |
@@ -103,21 +110,29 @@ The dashboard never enables fresh entries on page load. Its Start button identif
 .venv/bin/python live_4am_short.py
 ```
 
-Use one supervisor per state/account identity. The state lock prevents duplicate v3 instances from managing the same strategy. Entries/attempts and broker tokens are persisted before order submission; restart restores unresolved orders/positions with new entries paused. The initial stock/date attempt is consumed once attempted, including a failed locate. When re-entry is enabled, one separate attempt is permitted only after that initial position has fully closed by stop-loss. Failed initial attempts, other exits, and a second stop do not create further attempts. Existing unowned DAS positions or open orders in a candidate prevent a fresh trade.
+Use one supervisor per state/account identity. The state lock prevents duplicate v3 instances from managing the same strategy. Entries/attempts and broker tokens are persisted before order submission; restart restores unresolved orders/positions with new entries paused. The initial stock/date attempt is consumed once attempted, including a failed locate, except for the explicitly deferred unpaid eligibility checks described below. When re-entry is enabled, one separate attempt is permitted only after that initial position has fully closed by stop-loss. Failed initial attempts, other exits, and a second stop do not create further attempts. Existing unowned DAS positions or open orders in a candidate prevent a fresh trade.
 
 Once started or restoring saved exposure, the supervisor verifies DAS with a read-only account check every `das.health_check_seconds` (default **10**) and automatically reconnects and authenticates after failures, retrying every `das.reconnect_seconds` (default **5**). These checks continue after **Stop entries**; opening the UI alone does not connect to DAS. The dashboard shows the latest verified connection time and retry state. A disconnect blocks new entries without changing your Start/Stop choice; eligible, unattempted stocks may proceed once DAS recovers. Previously skipped attempts are not replayed. Existing broker orders can still fill during an outage, while the supervisor cannot manage positions or send covers; check open exposure in DAS. Wrong credentials or disabled CMD access require correction before a retry can succeed. Restart the Python service to load this change or connection-setting changes; refreshing the browser alone is insufficient.
 
 ### Live timing and execution
 
-The live universe includes Alpaca's active, tradable US equities, with optional `symbols` restriction. The supervisor obtains prior regular-session closes, collects early one-minute SIP bars and updated bars, and backfills the early window when starting or reconnecting. It does not depend on the backtest stock-list file for discovery. Prior closes use split-adjusted daily SIP bars for the exact preceding exchange session; Alpaca's [bar eligibility rules](https://docs.alpaca.markets/us/docs/market-data-faq) exclude extended-hours trade conditions from daily open/close prices.
+The live universe includes Alpaca's active, tradable US equities, with optional `symbols` restriction. The supervisor obtains prior regular-session closes, collects one-minute SIP bars and updated bars, and backfills discovery history when starting or reconnecting. With late-gap discovery enabled, that history extends from 04:00 through the current time, capped at the entry deadline. It does not depend on the backtest stock-list file for discovery. Prior closes use split-adjusted daily SIP bars for the exact preceding exchange session; Alpaca's [bar eligibility rules](https://docs.alpaca.markets/us/docs/market-data-faq) exclude extended-hours trade conditions from daily open/close prices.
 
 The early-window high follows the same minute-bar convention as the backtest. By default, the process waits an additional **35 seconds after 04:15** (`execution.final_bar_wait_seconds`) and refreshes the complete early window before allowing entries. This accommodates Alpaca `updatedBars` corrections. The ten-minute high delay must also have elapsed. This finalization can delay an otherwise eligible 04:15 entry until approximately 04:15:35 plus the backfill duration. Highs freeze after finalization.
 
+New late qualifiers use their own fixed **15-minute window from the first qualifying minute**, followed by the same final-bar wait and refresh. Entry requires both the completed window and ten-minute high delay, and must still occur before 09:00 under the supplied settings. For a first gap at 07:00, the window is 07:00–07:15; a high in the 07:14 minute permits entry from 07:25, subject to live readiness and execution checks.
+
 Entry is a resting DAS sell-short limit at the configured discount from the high, rounded upward to the valid price increment. If executable prices are already at/above the limit, DAS can fill immediately; otherwise it waits for a bounce. The actual fill depends on quotes, routing, liquidity, borrow, and the broker. Orders use DAS `DAY+`; the application requests cancellation at the entry deadline or when entries are paused/data readiness is lost. A cancel can race with a fill, so the application cannot promise exact deadline precision at the broker. Broker-reported fills at/after the deadline are flagged and covered. Partial fills are managed using the confirmed filled quantity and average price.
+
+The shared `strategy.min_entry_price` and `strategy.max_entry_price` settings currently restrict **initial and re-entry price gates to $1–$10, inclusive**. Live checks the planned limit and a fresh bid before locates or entry submission, and requests cancellation of unfilled entry shares when a fresh bid leaves that range. Existing filled shares continue through normal stop, target, and time-exit management. A resting sell limit guarantees only a minimum execution price: favorable fills above $10, or fills racing with a cancellation, remain possible. The range is an application eligibility check, not a broker-enforced maximum fill price. Monitor mode applies the same range checks to simulated entries.
 
 Borrow checks and paid locates now wait for price proximity as well as the existing timing, finalized-window, entry-deadline, and fresh-quote gates. Set `execution.locate_trigger_below_entry_percent` in `live_4am_short.json`: the default `1.0` starts a locate attempt when the fresh SIP **bid is at least 99% of the rounded entry limit**. For a $9.00 entry limit, the trigger is $8.91; bids at or above $9.00 also qualify. `0` requires the bid to reach the entry limit. JSON `null` disables the proximity gate and restores the legacy borrow attempt as soon as the other gates permit it. Waiting below the trigger does not consume the stock/date attempt.
 
-The 1% value is an adjustable starting point. A wider percentage starts borrowing earlier and gives DAS more time, but can spend locate fees on stocks that never reach entry. A narrower percentage delays that cost, but inquiry, borrow confirmation, and order-routing latency can miss a brief entry opportunity. Quotes are requested when the attempt starts; an earlier inquiry would not lock in later pricing because [DAS locate quotes can change](https://mirror.dastrader.com/docs/why-doesnt-my-locate-price-match-the-inquiry-price/). The supervisor rechecks the current bid and other entry gates immediately before paid locate actions, so a fade can stop a charge before it is sent. A price change during an in-flight action can still leave paid borrow unused. After borrow is confirmed, proximity no longer blocks submission or cancels the resting entry: the order continues under its original entry deadline and other existing cancellation rules. An unsuccessful or interrupted locate attempt still consumes the stock/date and is not automatically retried.
+The 1% value is an adjustable starting point. A wider percentage starts borrowing earlier and gives DAS more time, but can spend locate fees on stocks that never reach entry. A narrower percentage delays that cost, but inquiry, borrow confirmation, and order-routing latency can miss a brief entry opportunity. Quotes are requested when the attempt starts; an earlier inquiry would not lock in later pricing because [DAS locate quotes can change](https://mirror.dastrader.com/docs/why-doesnt-my-locate-price-match-the-inquiry-price/). The supervisor rechecks the current bid and other entry gates immediately before paid locate actions, so a fade can stop a charge before it is sent. A price change during an in-flight action can still leave paid borrow unused. After borrow is confirmed, proximity no longer blocks submission or cancels the resting entry: the order continues under its original entry deadline and other existing cancellation rules.
+
+If eligibility changes before borrowing, or the locate broker raises `LocateDeferred` to confirm that no paid command was sent, the initial attempt becomes **locate deferred**. The supervisor waits at least **30 seconds** before retrying and requires a fresh qualifying bid, enabled entries, and restored data/broker readiness. It keeps the original setup, entry limit, and deadline; the cooldown never extends the entry window. The deferred row is retained in state and on the dashboard, but does not count as an open position. The locate diagnostics retain the specific eligibility failure, observed bid, quote age, and any available route comparisons so an aborted inquiry does not appear as **Not requested**.
+
+Only that explicitly unpaid path can retry. Paid, uncertain, unsuccessful, and interrupted locate attempts are not replayed, and previously saved **skipped** rows stay skipped. A restart leaves new entries paused; a saved deferred attempt can resume only after **Start** and only while its original entry window remains open. Locate tokens and prior inquiries remain in the broker journal so late offers can still be rejected safely. Restart the Python service to load this behavior; refreshing the dashboard alone is insufficient. Route settings and inquiry spacing are unchanged, so the comparison delay described below can still miss a brief entry opportunity.
 
 Monitor mode mirrors the same price trigger before creating its simulated resting entry, without contacting DAS. The dashboard shows the configured locate timing on the Short entry rule card and each candidate's trigger in its Locate cell before a request. Historical backtest entry behavior and fees are unchanged by this live setting.
 
@@ -130,11 +145,11 @@ Keep the Python supervisor, Alpaca connection, and DAS session running while exp
 | `max_positions` | `0` | No additional position-count cap; positive values limit concurrent attempts/positions |
 | `max_locate_price` | `0.06` | Maximum locate cost per share in dollars |
 | `locate_trigger_below_entry_percent` | `1.0` | Begin borrowing when the fresh bid reaches this percent below the entry limit or higher; `0` requires the limit, `null` disables the price gate |
-| `reentry_enabled` | `null` | `true` enables live re-entry, `false` disables it; omitted or `null` inherits `strategy.reentry.enabled`. The supplied live JSON sets `false` |
+| `reentry_enabled` | `null` | `true` enables live re-entry, `false` disables it; omitted or `null` inherits `strategy.reentry.enabled`. The supplied live JSON sets `true` |
 | `cover_cushion_percent` | `1` | Buy-limit cushion above the current ask for covers |
 | `cover_replace_seconds` | `3` | Minimum interval before repricing/replacing a cover |
 | `poll_seconds` | `1` | Supervisor reconciliation interval |
-| `final_bar_wait_seconds` | `35` | Post-window wait before final early-window refresh |
+| `final_bar_wait_seconds` | `35` | Post-window wait before final setup-window refresh |
 | `shutdown_grace_seconds` | `30` | Graceful shutdown cover/reconciliation period |
 
 `alpaca.quote_max_age_seconds` defaults to 5. Stale, crossed, empty, or future-dated quotes cannot authorize entries. The data adapter reconnects and backfills; entry eligibility requires current data readiness.
@@ -160,15 +175,45 @@ The list supplies candidates, not confirmed setups. Each candidate must still pa
 
 All timestamps use `America/New_York`, including daylight saving time. Percent settings use human units: `30` means 30%, and `12.5` means 12.5%.
 
-1. Use the previous market session's regular-session close as the reference. A candidate qualifies if a one-minute bar's high is **strictly more than 30%** above that reference during `04:00 <= bar time < 04:15`.
-2. Record the highest high across that complete early window, then freeze it. By default, the last occurrence of a repeated high sets the waiting clock.
-3. Activate the short limit at the later of 04:15 and ten minutes after the early high. Minute bars cannot reveal the high's exact second, so the default clock starts at the **end of its minute**. For example, a high in the 04:14 bar permits entry from 04:25. Setting `high_time_reference` to `bar_start` uses 04:24 instead.
-4. Set the sell limit to 90% of the early high. If the active bar opens at or above the limit, fill at that open, subject to configured slippage. Otherwise, wait for a bounce up to the limit. Entry slippage never reduces a sell-limit fill below its limit.
-5. Permit fills only before 06:00. An unfilled order is canceled at that deadline.
+The supplied JSON enables `late_gap_enabled`, sets `late_gap_window_minutes` to `15`, and uses an initial entry deadline of `09:00`. Setting `late_gap_enabled` to `false` restores discovery only during the original early window. Code defaults leave late discovery off and use a `06:00` entry deadline; changing the discovery switch does not change the configured deadline.
+
+1. Use the previous market session's regular-session close as the reference. A candidate qualifies if a one-minute bar's high is **strictly more than 30%** above that reference. Original early qualifiers use `04:00 <= bar time < 04:15`. With late discovery enabled, a stock that has not already qualified may first qualify from 04:15 until the entry deadline, exclusively. Exactly 30% does not qualify.
+2. Record the highest high across the complete 04:00–04:15 window for early qualifiers. For a late qualifier, use a fixed 15-minute window starting with its first qualifying minute, inclusive, and ending 15 minutes later, exclusive. Freeze the high after that window. A higher high updates the reference; by default, the last occurrence of an equal high also resets the waiting clock within the window.
+3. Activate the short limit at the later of the setup window's end and ten minutes after its high. Minute bars cannot reveal the high's exact second, so the default clock starts at the **end of its minute**. An early high in the 04:14 bar permits entry from 04:25. For a first gap at 07:00, a high in the 07:00 bar permits entry from 07:15, while a high in the 07:14 bar permits entry from 07:25. Setting `high_time_reference` to `bar_start` starts the high delay one minute earlier; window completion still applies.
+4. Set the sell limit to 90% of the setup high. If the active bar opens at or above the limit, fill at that open, subject to configured slippage. Otherwise, wait for a bounce up to the limit. Entry slippage never reduces a sell-limit fill below its limit.
+5. Permit fills strictly before the entry deadline, **09:00 in the supplied JSON**. An unfilled order is canceled at that deadline. Late qualifiers whose window or high delay finishes at or after 09:00 cannot enter.
 6. Short 1,000 shares by default. Calculate the stop at 130% and target at 87.5% of the **actual simulated entry price**, including any entry slippage.
 7. Cover on a stop, target, or the open of the bar labeled 09:30. An open above the stop fills at that adverse open; a favorable opening gap through the target fills at the target. Configured exit slippage increases the cover price.
 
 The time exit takes precedence over later high/low prices within its minute. If an open position has no bar at the exact configured cutoff, it is marked `incomplete`; the simulator does not substitute a stale close or a later bar. A minute's open means its first eligible trade, not a guaranteed execution exactly on the minute boundary. Reported fill timestamps identify the bar, not the precise execution second.
+
+### Comparing live trades with the backtest
+
+The regular backtest still uses Massive minute bars; live discovery uses Alpaca SIP. To isolate that data-source difference, run this after the session's configured exit window has finished:
+
+```bash
+.venv/bin/python compare_4am_short_live.py --date 2026-09-23 --fetch-sip
+```
+
+This reads the saved live session, selects the newest backtest report containing that date, and reruns the shared simulator on historical **Alpaca SIP** bars. It compares entries, stop/target thresholds, exits, gross P/L and setup fields. It includes the union of live and backtest symbols, including skipped candidates and re-entry attempts. Add `--symbols DCOY` to focus on one stock or `--backtest-dir PATH` to select a report. Omitting `--date` selects today. The command never constructs a broker client or submits orders; only `--fetch-sip` makes read-only market-data/calendar requests.
+
+Results are saved under `outcome/4am_short_comparison/` as `comparison.md`, `comparison.json`, and (when fetched) `sip_data.json`. Run without `--fetch-sip` for a completely offline comparison of saved live/backtest records, or repeat the historical SIP simulation from its saved dataset:
+
+```bash
+.venv/bin/python compare_4am_short_live.py --date 2026-09-23 --sip-data PATH/TO/sip_data.json
+```
+
+The dataset preserves bars, prior close, strategy, retrieval time and simulator fingerprint. Repeated analysis uses those captured inputs and reports when simulator code differs. It does not silently fetch replacement bars. A prior close saved live is preferred; if only the backtest close exists, the report says so. Historical daily prices are not freshly split-adjusted to today's basis. Legacy live records have no strategy snapshot, so the report explicitly labels current-setting assumptions. A SIP rerun is a retrospective bar simulation: corrections, spreads, quote-based ask stops, borrow delays, partial fills and broker execution can still differ from live. Live waits for REST window verification (currently 35 seconds after the window, plus request latency); the bar simulator lacks those second-level events. Live can re-enter after a confirmed cover within a minute, while the backtest waits for the next minute.
+
+After restarting the live service with this version, each new entry attempt saves its actual loaded strategy, frozen setup bars, prior close/date and fresh quote in `entry_evidence` / `entry_attempt_evidence`. The first exit trigger saves its quote and thresholds in `exit_signal_evidence`. Per-process strategy and execution settings are retained in the day's `audit.sessions`. These snapshots explain future discrepancies even if historical bars are later corrected. They contain no credentials and are not a full tick archive. Optional evidence-capture failures do not interrupt position supervision.
+
+Both paths now share entry order-price rounding: round upward to cents at prices of $1 or more, or four decimal places below $1. This applies to initial entries and re-entries, including sweep simulations. Stop/target thresholds still use the actual entry fill without rounding the threshold itself. Rerun older backtests to apply this correction.
+
+### Entry price range
+
+Set `strategy.min_entry_price` and `strategy.max_entry_price` in `backtest_4am_short.json` to control the shared range for both initial trades and re-entries. The supplied configuration uses `1` and `10`; exactly $1 and exactly $10 are eligible. Either setting may be omitted or set to JSON `null` to remove that bound; the code defaults impose no bounds. Each configured bound must be a positive finite dollar amount, with the minimum no greater than the maximum.
+
+The backtest checks both the planned entry limit and the actual simulated entry price, including slippage and favorable opening fills. It never simulates an entry outside the range. A price outside the range can still be recorded as a gap candidate; the filter applies to entry eligibility. When an otherwise valid setup has an eligible limit but a bar would fill outside the range, the simulator waits for a later eligible bar before the existing entry deadline. Live additionally checks fresh bids as described above. Restart the live process to load a range change; existing backtest reports are unchanged until another backtest runs.
 
 ### Optional re-entry after a stop-loss
 
@@ -185,11 +230,11 @@ Re-entry is off by default. To enable it for backtests, set `strategy.reentry.en
 }
 ```
 
-For live trading, set `execution.reentry_enabled` in `live_4am_short.json` to `true` or `false`. This overrides the backtest switch without changing the shared re-entry percentages or times. Omit the live setting, or set it to JSON `null`, to inherit the backtest switch. The supplied files leave both switches off. Restart the live process after changing either file; the dashboard displays its effective setting.
+For live trading, set `execution.reentry_enabled` in `live_4am_short.json` to `true` or `false`. This overrides the backtest switch without changing the shared re-entry percentages or times. Omit the live setting, or set it to JSON `null`, to inherit the backtest switch. The supplied files enable re-entry and use an **08:00 re-entry deadline**; expanding initial discovery does not extend that cutoff. Restart the live process after changing either file; the dashboard displays its effective setting.
 
-After the initial trade is fully covered by its stop-loss, submit one new sell-short limit at **105% of the original 04:00–04:15 high**. The high stays frozen; later highs do not replace it. There is no additional high-based waiting period. Use the existing configured share size, a stop **20% above the actual re-entry fill**, and a target **40% below that fill**. The order may fill strictly before **09:20 Eastern**, independently of the initial entry deadline. Cancel an unfilled re-entry at that cutoff; cover an open re-entry at its configured time exit, also 09:20 by default. All these percentages and both times are configurable. A profit target, time exit, manual cover, incomplete initial exit, or failed initial locate does not qualify, and there is no third trade.
+With the default re-entry rules shown above, after the initial trade is fully covered by its stop-loss, submit one new sell-short limit at **105% of the original setup high**, from either the early or late setup window. The high stays frozen; later highs do not replace it. There is no additional high-based waiting period. Use the existing configured share size, a stop **20% above the actual re-entry fill**, and a target **40% below that fill**. The default order may fill strictly before **09:20 Eastern**, independently of the initial entry deadline. Cancel an unfilled re-entry at its configured cutoff; cover an open re-entry at its configured time exit, also 09:20 by default. All these percentages and both times are configurable. A profit target, time exit, manual cover, incomplete initial exit, or failed initial locate does not qualify, and there is no third trade.
 
-This is a sell-short **limit**. When the market is already above the re-entry limit, it can fill immediately after the stop-out; it does not require an additional rise above the stop-out price. For example, with a $10 early high, a $9 initial fill stops at $11.70, while the re-entry limit is $10.50. A bid still near $11.70 is already eligible to fill that limit.
+This is a sell-short **limit**. When the market is already above the re-entry limit, it can fill immediately after the stop-out; it does not require an additional rise above the stop-out price. For example, with a $10 early high, a $9 initial fill stops at $11.70, while the re-entry limit is $10.50. A bid still near $11.70 can fill that limit if the entry price bounds allow it; the supplied $10 maximum blocks this example's re-entry.
 
 Live re-entry checks that enough borrow is still available in DAS and reuses it. It never buys additional locates for the second trade; insufficient available borrow skips the re-entry. Covering the first short does not by itself guarantee that the broker permits reuse. New entries must remain enabled, feed/quote and broker checks still apply, and the first position and its orders must be fully reconciled before re-entry. The paid-locate proximity gate applies to the initial trade; re-entry does not buy borrow and may place its resting limit after the stop-out.
 
@@ -259,8 +304,12 @@ The following parameters belong inside `strategy`:
 | `gap_percent` | `30` | Strictly exceed this gain above previous close |
 | `early_start` | `"04:00"` | Inclusive early-window start |
 | `early_end` | `"04:15"` | Exclusive early-window end |
-| `wait_after_high_minutes` | `10` | Minimum delay after the early high |
-| `entry_below_high_percent` | `10` | Sell limit discount from early high |
+| `late_gap_enabled` | `false` | Continue discovering new qualifiers after `early_end` and strictly before `entry_deadline` |
+| `late_gap_window_minutes` | `15` | Fixed high-tracking window starting at a late qualifier's first qualifying minute |
+| `wait_after_high_minutes` | `10` | Minimum delay after the setup high; setup window must also be complete |
+| `entry_below_high_percent` | `10` | Sell limit discount from setup high |
+| `min_entry_price` | `null` | Inclusive minimum entry price for both initial trades and re-entries; supplied JSON uses `1` |
+| `max_entry_price` | `null` | Inclusive maximum entry price for both initial trades and re-entries; supplied JSON uses `10`; live sell limits cannot enforce a maximum fill price |
 | `entry_deadline` | `"06:00"` | Exclusive entry deadline |
 | `stop_loss_percent` | `30` | Stop above actual entry |
 | `profit_target_percent` | `12.5` | Target below actual entry |
@@ -309,7 +358,7 @@ CSV records include `strategy_id` and `strategy_name`; the summary and resolved 
 
 The terminal and `4am_short_trade_details.txt` show the previous regular-session close,
 the configured gap threshold, the first qualifying bar's time and high, the
-04:00–04:15 early high and its source bar, the waiting-clock reference, the
+early or late setup high and its source bar, the waiting-clock reference, the
 short limit and activation time, actual entry time/price/shares, stop and target
 prices, exit time/price/reason, target-hit status, and P&L. Window labels and
 percentages follow the JSON settings. Times display Eastern AM/PM with EST/EDT.
@@ -319,6 +368,8 @@ not receive a completed-trade result.
 The candidate and trade CSV files also include `first_gap_bar_high`, `early_high_bar_time`, and
 `profit_target_hit`. `first_gap_time` and `early_high_bar_time` identify minute
 starts; `early_high_time` remains the wait reference (the minute's end by default).
+The existing `early_high` fields also store the high from a late setup's fixed
+window; text reports label these as **Late setup high** and show that window.
 The first qualifying bar's high is an observed bar high, not an exact first-crossing
 trade price. `profit_target_hit` is `True` for a profit-target exit, `False` for a
 completed stop or time exit, and blank when no completed exit exists. A profitable
@@ -360,6 +411,11 @@ winner nor loser averages. An absent group displays `--`; profit factor displays
 `inf` for wins without losses, `0.00` for losses without wins, and `--` when
 neither exists. Interrupted runs mark the final summary `PARTIAL`.
 
+The terminal ends with today's Eastern date and net P/L from today's completed
+trades, including re-entries. It shows `--` if today has no results in this run,
+and `PARTIAL` if the run was interrupted or today's results include errors or
+incomplete trades.
+
 These statistics are also saved in the summary JSON and daily/monthly CSVs as
 `average_winner_net_pnl`, `average_loser_net_pnl`, `biggest_winner_net_pnl`,
 `biggest_loser_net_pnl`, plus the existing `average_net_pnl` and `profit_factor`.
@@ -368,8 +424,9 @@ profit factor; the win/loss counts distinguish that case from an undefined ratio
 
 Before that performance table, a gap-to-trade summary shows each month's
 `Gap Triggers`, `Traded`, `Not Traded`, and `Traded%`, with a `TOTAL` row.
-It counts stock/date setups with a confirmed first gap in the configured early
-window (by default, strictly more than 30% during 04:00–04:15 Eastern).
+It counts stock/date setups with a confirmed first gap in the configured discovery
+window: strictly more than 30% from 04:00 until 09:00 in the supplied JSON.
+With `late_gap_enabled: false`, discovery ends at `early_end` (04:15 by default).
 `Traded` means the entry filled, including positions whose exit remains
 unresolved; the summary separately shows completed and unresolved entries.
 Thus `Gap Triggers = Traded + Not Traded`. A stock/date is counted only once in
@@ -377,7 +434,7 @@ these setup counts. Completed `Trades` include initial and re-entry trades, so
 they can exceed `Traded` when re-entry is enabled, or fall below it if an exit is missing.
 
 Qualified but untraded setups are broken down by reason, such as no fill before
-the entry deadline. No-early-bar, below-threshold, and data-error candidates
+the entry deadline. Missing-discovery-bar, below-threshold, and data-error candidates
 are outside the confirmed-trigger count; data errors do not establish that
 the gap condition failed. The daily/monthly CSV and summary JSON include
 `gap_triggered`, `gap_traded`, `gap_not_traded`, `gap_traded_percent`,

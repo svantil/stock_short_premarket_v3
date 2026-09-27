@@ -15,12 +15,14 @@ from typing import Sequence
 
 from .config import StrategyConfig
 from .models import Bar, DataError, TradeResult
+from .pricing import order_price
 from .strategy import (
     EASTERN,
     ONE_MINUTE,
     _at,
     _buy_fill,
     _choose_path,
+    _entry_bar_out_of_range,
     _path,
     _price_percent,
     _record_entry,
@@ -81,7 +83,7 @@ def simulate_prepared(case: PreparedReentryCase, config: StrategyConfig) -> Trad
         raise DataError(f"Unknown intrabar policy: {config.intrabar_policy}")
     initial = case.initial
     assert initial.early_high is not None
-    limit = _price_percent(initial.early_high, config.reentry.entry_above_high_percent, 1)
+    limit = order_price(_price_percent(initial.early_high, config.reentry.entry_above_high_percent, 1))
     result = TradeResult(
         date=initial.date,
         symbol=initial.symbol,
@@ -107,6 +109,9 @@ def simulate_prepared(case: PreparedReentryCase, config: StrategyConfig) -> Trad
     )
     deadline = _at(case.day, config.reentry.entry_deadline)
     cutoff = _at(case.day, config.reentry.time_exit)
+    if not config.entry_price_allowed(limit):
+        result.reason = "entry_price_out_of_range"
+        return result
     if case.activation >= deadline:
         result.reason = "activation_at_or_after_deadline"
         return result
@@ -120,6 +125,7 @@ def simulate_prepared(case: PreparedReentryCase, config: StrategyConfig) -> Trad
         locate_fee_per_share=0.0,
     )
     stop = target = None
+    rejected_entry_price = False
     for index in range(case.first_index, len(case.bars)):
         bar = case.bars[index]
         stamp = case.stamps[index]
@@ -136,6 +142,9 @@ def simulate_prepared(case: PreparedReentryCase, config: StrategyConfig) -> Trad
 
         if result.entry_price is None:
             if bar.high < limit:
+                continue
+            if _entry_bar_out_of_range(bar, limit, retry_config):
+                rejected_entry_price = True
                 continue
             # The entry minute can hit its low before the sell limit becomes
             # active. Use the full reference paths for that chronology.
@@ -178,7 +187,10 @@ def simulate_prepared(case: PreparedReentryCase, config: StrategyConfig) -> Trad
             )
 
     if result.entry_price is None:
-        result.reason = "entry_not_filled_before_deadline"
+        result.reason = (
+            "entry_price_out_of_range" if rejected_entry_price
+            else "entry_not_filled_before_deadline"
+        )
     else:
         result.status = "incomplete"
         result.reason = "missing_time_exit_bar"

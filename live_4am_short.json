@@ -31,7 +31,7 @@
     "reentry_enabled": true,
     "max_positions": 0,
     "max_locate_price": 0.06,
-    "locate_trigger_below_entry_percent": 2,
+    "locate_trigger_below_entry_percent": 5,
     "cover_cushion_percent": 1,
     "cover_replace_seconds": 3,
     "poll_seconds": 1,

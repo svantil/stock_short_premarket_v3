@@ -14,7 +14,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Callable
 
-from .das import DasError, _atom, _locate_size_skip, _number
+from .das import DasError, LocateDeferred, _atom, _locate_size_skip, _number
 from .config import OFFER_LOCATE_ROUTES, CAPPED_LOCATE_ROUTES, UNCAPPED_LOCATE_ROUTES
 from zoneinfo import ZoneInfo
 
@@ -45,25 +45,54 @@ class OfferManager:
         self.last_service = -float("inf")
         self.still_valid: Callable[[], bool] | None = None
 
-    def _before_purchase(self, symbol: str) -> None:
+    def _eligible(self) -> bool:
+        try:
+            return self.still_valid is None or bool(self.still_valid())
+        except Exception as exc:
+            raise DasError("Cannot verify entry eligibility; no paid locate command sent") from exc
+
+    @staticmethod
+    def _never_paid(record: dict[str, Any]) -> bool:
+        return bool(record.get("requests")) and all(
+            request.get("phase") in _UNPAID and not request.get("execution_evidence")
+            for request in record["requests"])
+
+    def _defer_unpaid(self, key: str, reason: str) -> None:
+        """Only positively never-sent purchases may release the daily attempt."""
+        self._check_evidence()
+        record = self.records[key]
+        if not self._never_paid(record):
+            raise DasError("Entry eligibility failed with a prior paid locate intent; reconcile before retrying")
+        # Preserve ownership, including slow offers which have not arrived yet.
+        # A cleanup or journal failure remains an ordinary DasError.
+        self._reject_ready()
+        record.update(state="entry_deferred", deferred_before_paid_send=True,
+                      deferred_reason=reason)
+        self._save()
+        for result in self.client.locate_comparisons.get(record["symbol"], []):
+            if result.get("eligible") or result.get("selected"):
+                result.update(eligible=False, selected=False, reason=reason)
+        raise LocateDeferred(reason)
+
+    def _before_purchase(self, symbol: str, key: str) -> None:
         self._check_evidence()
         if any(row["symbol"] == symbol and row["token"] not in self.known
                and row["status"] not in _ENDED | {"located"}
                for row in self.client._locates.values()):
             self._reject_ready()
             raise DasError("An unowned locate appeared during comparison; no purchase sent")
-        if self.still_valid is not None and not self.still_valid():
-            self._reject_ready()
-            raise DasError("Entry eligibility expired or trading paused before paid locate; no purchase sent")
+        if not self._eligible():
+            self._defer_unpaid(key, "Entry eligibility expired or trading paused before paid locate; no purchase sent")
 
     def _paid_send(self, key: str, request: dict[str, Any], command: str) -> None:
         # Recheck after the journal fsync, immediately before the command.
-        if self.still_valid is not None and not self.still_valid():
+        if not self._eligible():
             request["phase"] = "quote_only" if request["route_type"] == 0 else "never_accept"
-            self.records[key]["state"] = "entry_expired"
+            # This function has not called _send. Undo the durable paid intent
+            # before recording that a fresh comparison may safely be attempted.
+            self.records[key]["state"] = "offers_requested"
             self._save()
-            self._reject_ready()
-            raise DasError("Entry eligibility expired before paid locate command; no purchase sent")
+            self._defer_unpaid(key, "Entry eligibility expired before paid locate command; no purchase sent")
         self.client._send(command)
 
     def _load(self) -> None:
@@ -330,12 +359,12 @@ class OfferManager:
                 result.update(eligible=True, reason="")
         return result, quote
 
-    def _refresh_uncapped_quote(self, symbol: str, shares: int, route: str) -> None:
+    def _refresh_uncapped_quote(self, symbol: str, shares: int, route: str, key: str) -> None:
         """Recheck the selected uncapped route immediately before spending."""
         delay = self.client._last_inquiry + 3.0 - time.monotonic()
         if delay > 0:
             time.sleep(delay)
-        self._before_purchase(symbol)
+        self._before_purchase(symbol, key)
         self.fees.pop(route, None)
         self.replies.pop((symbol, route), None)
         self.client._send(f"SLRouteMinCharge {route}")
@@ -354,7 +383,7 @@ class OfferManager:
             if not self.client.settings.allow_uncapped_locate_purchases or route not in UNCAPPED_LOCATE_ROUTES:
                 raise DasError("Uncapped locate purchases are not enabled; no purchase was sent")
             try:
-                self._refresh_uncapped_quote(symbol, shares, route)
+                self._refresh_uncapped_quote(symbol, shares, route, key)
             except DasError as exc:
                 result.update(eligible=False, reason=f"Selected quote could not be refreshed; no purchase sent: {exc}")
                 raise
@@ -370,7 +399,7 @@ class OfferManager:
             self._reject_ready()
             result.update(eligible=False, reason="Selected quote or minimum fee changed before purchase")
             raise DasError("DAS selected quote or minimum fee changed before purchase; no purchase was sent")
-        self._before_purchase(symbol)
+        self._before_purchase(symbol, key)
         winner.update(phase="purchase_pending", quoted_price=str(price), minimum_fee=minimum_fee)
         self.records[key]["state"] = "purchase_pending"
         self._save()
@@ -419,6 +448,9 @@ class OfferManager:
                     f"{shares} shares, ${actual_total:.2f} total"
                     + (f". {result['warning']}" if result["warning"] else ""), route,
                     float(actual_total / shares))
+        except LocateDeferred as exc:
+            result.update(eligible=False, selected=False, reason=str(exc))
+            raise
         except DasError as exc:
             notes = f" ({failure['notes']})" if failure and failure["notes"] else ""
             result.update(eligible=False, reason=f"Locate purchase requires reconciliation{notes}: {exc}")
@@ -482,7 +514,11 @@ class OfferManager:
         if not preview and self.client._available_locates(symbol) >= shares:
             return True, "DAS confirms existing located shares", "existing", 0.0
         if previous and not preview:
-            raise DasError("DAS locate already attempted today; no duplicate offer request or acceptance was sent")
+            if not (previous.get("state") == "entry_deferred"
+                    and previous.get("deferred_before_paid_send") is True
+                    and self._never_paid(previous)):
+                raise DasError("DAS locate already attempted today; no duplicate offer request or acceptance was sent")
+            self._reject_ready()
         # Reconcile prior paid intents and reuse existing borrow BEFORE applying
         # current route minimums. A minimum must not hide an old uncertain buy.
         skipped = [{**row, "route_type": 1 if route in offer_routes else 0}
@@ -513,6 +549,11 @@ class OfferManager:
                              "route_type": 1 if route in offer_routes else 0,
                              "price_cap_enforced": route not in uncapped_routes,
                              "phase": "never_accept" if route in offer_routes else "quote_only"})
+        if previous and not preview:
+            # Keep every old token owned and permanently unpaid. Late offers
+            # are rejected by cleanup and never enter the new candidate list.
+            archive_key = f"{key}:deferred:{uuid.uuid4().hex}"
+            self.records[archive_key] = previous
         self.records[key] = {
             "mode": "priced_only" if priced_mode else "offer_only",
             "symbol": symbol, "shares": shares, "state": "offers_requested",
@@ -643,7 +684,7 @@ class OfferManager:
             raise DasError("DAS selected offer or minimum fee changed before acceptance; no acceptance was sent")
         # Sending rejects is harmless for other never-accepted requests. Their
         # acknowledgments, Pending and Waiting responses do not gate this offer.
-        self._before_purchase(symbol)
+        self._before_purchase(symbol, key)
         winner.update(phase="accept_pending", id=offered["id"], quoted_price=str(price),
                       minimum_fee=minimum_fee)
         self.records[key]["state"] = "accept_pending"
@@ -669,6 +710,9 @@ class OfferManager:
             return (True, f"DAS {winner['route']}: lowest affordable priced offer received; "
                     f"{shares} shares, ${Decimal(winner['total_cost']):.2f} total", winner["route"],
                     float(Decimal(winner["total_cost"]) / shares))
+        except LocateDeferred as exc:
+            result.update(eligible=False, selected=False, reason=str(exc))
+            raise
         except DasError as exc:
             result.update(eligible=False, reason=f"Accepted offer requires reconciliation: {exc}")
             raise

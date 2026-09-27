@@ -27,6 +27,8 @@ class ConfigAndReportTests(unittest.TestCase):
     def test_defaults_paths_and_deduplicated_input(self):
         config = self.config()
         self.assertEqual(config.strategy.shares, 1000)
+        self.assertFalse(config.strategy.late_gap_enabled)
+        self.assertEqual(config.strategy.late_gap_window_minutes, 15)
         self.assertEqual(config.strategy_name, "4am short")
         self.assertEqual(config.strategy_id, "4am_short")
         self.assertEqual(config.output_dir, self.root / "outcome" / "4am_short")
@@ -40,6 +42,9 @@ class ConfigAndReportTests(unittest.TestCase):
             {"strategy": {"gap_percent": "30"}}, {"strategy": {"gap_percent": float("nan")}},
             {"strategy": {"entry_deadline": "04:10"}}, {"strategy": {"early_start": "4:00"}},
             {"strategy": {"profit_target_percent": 100}}, {"strategy": {"intrabar_policy": "guess"}},
+            {"strategy": {"late_gap_enabled": "true"}}, {"strategy": {"late_gap_enabled": 1}},
+            {"strategy": {"late_gap_window_minutes": 0}}, {"strategy": {"late_gap_window_minutes": True}},
+            {"strategy": {"late_gap_window_minutes": 15.5}},
             {"data": {"max_retries": -1}}, {"symbols": "AAA"}, {"from_date": "20260101"},
         ]
         for value in invalid:
@@ -47,6 +52,13 @@ class ConfigAndReportTests(unittest.TestCase):
                 self.raw = {"input_file": "stocks.csv", **value}
                 with self.assertRaises(DataError):
                     self.config()
+
+    def test_late_window_parameters_are_loaded_and_snapshotted(self):
+        self.raw["strategy"] = {"late_gap_enabled": True, "late_gap_window_minutes": 15,
+                                "entry_deadline": "09:00"}
+        config = self.config()
+        self.assertTrue(config.strategy.late_gap_enabled)
+        self.assertEqual(config.snapshot()["strategy"]["late_gap_window_minutes"], 15)
 
     def test_input_filters_and_precise_error_line(self):
         self.raw.update(from_date="2026-01-05", symbols=["aaa"])

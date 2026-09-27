@@ -35,6 +35,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"4am short | {'DEMO — sample data only' if settings.demo else settings.mode}")
     print(f"Shared rules: {settings.strategy_config_path}")
     print(f"{settings.strategy.shares:,} shares | early {settings.strategy.early_start}–{settings.strategy.early_end} ET | entry before {settings.strategy.entry_deadline} | exit {settings.strategy.time_exit}")
+    minimum = f"${settings.strategy.min_entry_price:g}" if settings.strategy.min_entry_price is not None else "no minimum"
+    maximum = f"${settings.strategy.max_entry_price:g}" if settings.strategy.max_entry_price is not None else "no maximum"
+    print(f"Entry price gate: {minimum} to {maximum} (inclusive; initial and re-entry)")
+    if settings.strategy.late_gap_enabled:
+        print(f"Late discovery: new qualifiers before {settings.strategy.entry_deadline} ET | {settings.strategy.late_gap_window_minutes}-minute window from first gap | entry after window and {settings.strategy.wait_after_high_minutes}-minute high delay")
+    else:
+        print("Late discovery: OFF — only the original early window qualifies")
     if args.validate_only:
         print("Configuration valid. No market or broker connections opened.")
         return 0

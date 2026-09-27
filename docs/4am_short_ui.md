@@ -4,7 +4,9 @@ The independent v3 dashboard displays live Alpaca SIP data, DAS execution and lo
 
 All clocks, signal times, and fill times are shown in **America/New_York**, including daylight saving time. The rule cards display the actual configured times and percentages.
 
-The re-entry cards show its effective live **ON/OFF** setting, limit above the original early high, stop and target percentages, entry deadline, and time exit. Set `strategy.reentry` in `backtest_4am_short.json` for the shared rules. Set `execution.reentry_enabled` to `true` or `false` in `live_4am_short.json` to control live re-entry independently; omitted or JSON `null` inherits the shared switch. Changes take effect after restarting the service. The dashboard controls do not change these settings.
+The **Find the gap** card shows the full discovery interval. The supplied `strategy.late_gap_enabled: true` allows new stocks to qualify strictly above 30% from 04:00 until 09:00, with 09:00 excluded. Original 04:00–04:15 qualifiers retain their early-window setup. Later first qualifiers use their own fixed `late_gap_window_minutes` window (15 minutes in the supplied JSON), then the same ten-minute delay from the high. The **Wait for high** card shows both requirements and the high-time convention. Entry must still fill before 09:00; a late signal does not extend that deadline. Set `late_gap_enabled` to `false` to restore early-window discovery. Restart the service to load rule changes.
+
+The re-entry cards show its effective live **ON/OFF** setting, limit above the original setup high, stop and target percentages, entry deadline, and time exit. Set `strategy.reentry` in `backtest_4am_short.json` for the shared rules. Set `execution.reentry_enabled` to `true` or `false` in `live_4am_short.json` to control live re-entry independently; omitted or JSON `null` inherits the shared switch. Changes take effect after restarting the service. The dashboard controls do not change these settings. The supplied re-entry cutoff remains 08:00, independently of the expanded initial discovery.
 
 ## Controls
 
@@ -18,7 +20,7 @@ Opening or refreshing the page only reads state. It never starts the strategy. C
 
 ## Reading the desk
 
-The candidate table shows the previous regular close, first qualifying early gap and time, early high and time, short-entry limit and activation time, bid/ask with quote age, locate state, and entry status. Filter by symbol or show only qualified candidates.
+The candidate table shows the previous regular close, first qualifying gap and time, setup high and time, short-entry limit and activation time, bid/ask with quote age, locate state, and entry status. The setup high comes from the early window or a late qualifier's own fixed window. Both use the configured final-bar wait and refresh before live entry. Filter by symbol or show only qualified candidates.
 
 The **Short entry** rule card also shows the live locate trigger from `execution.locate_trigger_below_entry_percent`. The default `1.0` waits for a fresh bid at or above 99% of the rounded entry limit; bids at or above the limit qualify too. For a $9.00 limit, the candidate's **Locate** cell reads **Bid ≥ $8.91 / Not requested** until an attempt starts. A candidate below that threshold displays **waiting for price** in the amber status style. The existing window-finalization, high-delay, deadline, and quote-freshness checks still apply. Waiting for price leaves the stock/date unconsumed.
 
@@ -30,7 +32,7 @@ The candidate panel states the active policy for `das.locate_quote_routes` (`LOC
 
 The positions table labels each row **Initial** or **Re-entry** and retains both trades for the same stock. It uses confirmed fills for entry average price, entry time, remaining shares, stop and target prices, exit average and time, exit reason, and profit-target outcome. Realized live P/L is shown separately from backtest net P/L; live fees may not be available from the fill stream.
 
-Enabled re-entry permits one second attempt only after the first position is fully stopped out. Its default limit is 5% above the original early high, stop is 20% above its actual fill, target is 40% below its fill, and both the entry cutoff and time exit are 09:20 ET. A market already above that limit can fill immediately. DAS must confirm reusable borrow; the second attempt never purchases new locates. The initial paid-locate proximity gate does not delay this borrow check. Stop entries also disables re-entries.
+Enabled re-entry permits one second attempt only after the first position is fully stopped out. Its default limit is 5% above the original setup high, stop is 20% above its actual fill, target is 40% below its fill, and both the entry cutoff and time exit are 09:20 ET; the cards show the actual configured values. A market already above that limit can fill immediately. DAS must confirm reusable borrow; the second attempt never purchases new locates. The initial paid-locate proximity gate does not delay this borrow check. Stop entries also disables re-entries.
 
 The monthly backtest table includes gap triggers, traded and untraded setups, completed trades, wins and losses, win/loss percentages, net P/L, average per trade, profit factor, drawdown, winning and losing days, and total stop-loss exits. A TOTAL row uses the overall saved summary. Gap counts include each stock/date once; completed trades count initial and re-entry trades separately. Both stopping out counts as two stop-loss exits. Entered setups can include unresolved exits. The table footer shows saved re-entry attempts, completed trades, and skipped attempts when available.
 

@@ -193,6 +193,39 @@ class MassiveTests(unittest.TestCase):
         with self.assertRaisesRegex(DataError, "completed historical"):
             MassiveClient(self.config, None, offline=True).minute_bars("XYZ", today)
 
+    def test_today_delayed_bars_paginate_and_refresh_without_cache(self):
+        today = datetime.now(ET).date()
+        request = self.network(
+            aggregates(status="DELAYED", rows=[bar(today)],
+                       next_url="https://api.massive.com/page?cursor=two"),
+            aggregates(status="DELAYED", rows=[bar(today, "04:02")]),
+            aggregates(status="DELAYED", rows=[bar(today), bar(today, "04:02"),
+                                                bar(today, "04:03")]),
+        )
+        first = self.client.minute_bars("XYZ", today)
+        self.assertEqual([item.timestamp.minute for item in first], [0, 2])
+        refreshed = self.client.minute_bars("XYZ", today)
+        self.assertEqual([item.timestamp.minute for item in refreshed], [0, 2, 3])
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(self.cache_files(), [])
+
+    def test_historical_delayed_response_can_be_read_from_validated_cache(self):
+        self.network(aggregates(status="DELAYED"))
+        expected = self.client.minute_bars("XYZ", DAY)
+        offline = MassiveClient(self.config, None, offline=True)
+        with patch.object(offline._opener, "open", side_effect=AssertionError("network called")):
+            self.assertEqual(offline.minute_bars("XYZ", DAY), expected)
+
+    def test_error_after_delayed_page_is_rejected_without_caching(self):
+        self.network(
+            aggregates(status="DELAYED", next_url="https://api.massive.com/page?cursor=two"),
+            {"status": "ERROR", "message": "fixture-secret"},
+        )
+        with self.assertRaisesRegex(DataError, "status OK or DELAYED") as error:
+            self.client.minute_bars("XYZ", DAY)
+        self.assertNotIn("fixture-secret", str(error.exception))
+        self.assertEqual(self.cache_files(), [])
+
     def test_pagination_is_complete_and_strips_query_credentials(self):
         request = self.network(
             aggregates(next_url="https://api.massive.com/v2/aggs/ticker/XYZ/range/1/minute/2025-03-10/2025-03-10?cursor=two&apiKey=secret-from-server"),
@@ -239,6 +272,9 @@ class MassiveTests(unittest.TestCase):
     def test_invalid_aggregate_payloads_are_not_cached(self):
         invalid = [
             {"status": "ERROR", "message": "fixture-secret"},
+            aggregates(status=None), aggregates(status="NOT_AUTHORIZED"),
+            aggregates(status="DELAYED", ticker="WRONG"),
+            aggregates(status="DELAYED", rows=[{**bar(), "c": 100}]),
             aggregates(adjusted=True), aggregates(ticker="WRONG"),
             aggregates(resultsCount=2), aggregates(rows=[{**bar(), "c": 100}]),
             aggregates(rows=[{**bar(), "o": 0}]), aggregates(rows=[{**bar(), "o": "14"}]),

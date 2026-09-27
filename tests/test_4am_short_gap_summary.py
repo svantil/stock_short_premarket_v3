@@ -109,6 +109,26 @@ class GapSummaryTests(unittest.TestCase):
         self.assertRegex(text, r"\bET\b|Eastern")
         self.assertEqual(table_row(text, "TOTAL")[1:], ["0", "0", "0", "0.00%"])
 
+    def test_late_gap_discovery_uses_entry_deadline_and_counts_missing_discovery_bars(self):
+        config = StrategyConfig(late_gap_enabled=True, entry_deadline="09:00")
+        rows = [
+            TradeResult("2026-01-05", "LATE", "skipped", "activation_at_or_after_deadline",
+                        first_gap_time="2026-01-05T08:50:00-05:00"),
+            TradeResult("2026-01-05", "EMPTY", "skipped", "no_premarket_bars"),
+        ]
+        text = format_gap_summary(rows, config)
+        self.assertIn("04:00 <= time < 09:00 Eastern", text)
+        self.assertNotIn("time < 04:15", text)
+        self.assertIn("Order activation at or after 09:00 Eastern: 1", text)
+        self.assertIn("1 no discovery bars", text)
+        self.assertEqual(table_row(text, "TOTAL")[1:], ["1", "0", "1", "0.00%"])
+
+    def test_disabled_late_discovery_keeps_early_cutoff_with_later_entry_deadline(self):
+        config = StrategyConfig(late_gap_enabled=False, entry_deadline="09:00")
+        text = format_gap_summary([], config)
+        self.assertIn("04:00 <= time < 04:15 Eastern", text)
+        self.assertNotIn("time < 09:00", text)
+
 
 if __name__ == "__main__":
     unittest.main()

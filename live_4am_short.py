@@ -87,6 +87,9 @@ def main(argv: list[str] | None = None) -> int:
             settings = replace(settings, demo=True, mode="monitor")
         print(f"4am short | {'DEMO — sample data only' if settings.demo else settings.mode}")
         print(f"Shared rules: {settings.strategy_config_path}")
+        minimum = f"${settings.strategy.min_entry_price:g}" if settings.strategy.min_entry_price is not None else "no minimum"
+        maximum = f"${settings.strategy.max_entry_price:g}" if settings.strategy.max_entry_price is not None else "no maximum"
+        print(f"Entry price gate: {minimum} to {maximum} (inclusive; initial and re-entry)")
         if args.validate_only:
             print("Configuration valid. No market or broker connections opened.")
             return 0

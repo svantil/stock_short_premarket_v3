@@ -78,7 +78,7 @@ class CLITests(unittest.TestCase):
         for heading in ("Gap-to-trade summary - 4am short", "Gap Triggers", "Not Traded", "Monthly summary - 4am short", "Wins", "Losses", "Loss%", "Avg/Trade", "Max DD", "Win Days", "Loss Days", "Stop Stocks"):
             self.assertIn(heading, details)
             self.assertIn(heading, self.output.getvalue())
-        for text in (details, self.output.getvalue()):
+        for text in (details, self.output.getvalue().rsplit("\n\n", 1)[0]):
             self.assertNotIn("Re-entry monthly summary - 4am short", text)
             self.assertNotIn("Max Stop Stocks", text)
             self.assertLess(text.index("Monthly summary - 4am short"), text.index("Trade summary - 4am short"))
@@ -115,6 +115,64 @@ class CLITests(unittest.TestCase):
             provider.return_value.previous_close.side_effect = DataError("missing prior close")
             self.assertEqual(self.run_cli("--offline"), 3)
         self.assertEqual(self.summary()[1]["statistics"]["errors"], 2)
+
+    def test_today_after_cutoff_accepts_delayed_prices_without_caching_minutes(self):
+        self.input.write_text("2026-09-23 WHLR\n")
+        self.config.write_text(json.dumps({
+            "input_file": "stocks.txt", "shares": 1000,
+            "data": {"request_delay_seconds": 0},
+        }))
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 9, 23, 10, 0, tzinfo=EASTERN).astimezone(tz)
+
+        def bar(day, clock, opening, high, low, close):
+            stamp = datetime.fromisoformat(f"{day}T{clock}:00").replace(tzinfo=EASTERN)
+            return {"t": int(stamp.timestamp() * 1000), "o": opening,
+                    "h": high, "l": low, "c": close, "v": 1000}
+
+        payloads = [
+            {"status": "OK", "ticker": "SPY", "adjusted": False,
+             "results": [bar("2026-09-22", "00:00", 10, 10, 10, 10)], "resultsCount": 1},
+            {"status": "OK", "symbol": "WHLR", "from": "2026-09-22", "close": 10},
+            {"status": "OK", "results": []},
+            {"status": "DELAYED", "ticker": "WHLR", "adjusted": False, "resultsCount": 3,
+             "results": [bar("2026-09-23", "04:00", 13.1, 14, 13.1, 13.5),
+                         bar("2026-09-23", "04:15", 13, 13.1, 12, 12.5),
+                         bar("2026-09-23", "09:30", 12.2, 12.3, 12.1, 12.2)]},
+        ]
+        with patch("four_am_short.cli.datetime", Clock), \
+             patch("four_am_short.massive.datetime", Clock), \
+             patch("four_am_short.cli.read_api_key", return_value="fixture-secret"), \
+             patch("four_am_short.massive.build_opener") as opener:
+            request = opener.return_value.open
+            request.side_effect = [io.BytesIO(json.dumps(payload).encode()) for payload in payloads]
+            self.assertEqual(self.run_cli(), 0, self.output.getvalue())
+
+        self.assertEqual(request.call_count, 4)
+        self.assertIn("/range/1/minute/2026-09-23/2026-09-23", request.call_args.args[0].full_url)
+        folder, summary = self.summary()
+        self.assertEqual(summary["statistics"]["trades"], 1)
+        self.assertEqual(summary["statistics"]["errors"], 0)
+        self.assertEqual(summary["statistics"]["incomplete"], 0)
+        self.assertAlmostEqual(summary["statistics"]["net_pnl"], 800)
+        self.assertEqual(self.output.getvalue().strip().splitlines()[-1], "2026-09-23 | Net P/L: $800.00")
+        with (folder / "4am_short_trades.csv").open(newline="") as handle:
+            trade, = csv.DictReader(handle)
+        self.assertEqual(trade["date"], "2026-09-23")
+        self.assertEqual(trade["symbol"], "WHLR")
+        self.assertEqual(trade["exit_reason"], "time_exit")
+        self.assertEqual(trade["exit_time"], "2026-09-23T09:30:00-04:00")
+        cached_paths = {
+            json.loads(path.read_text())["request"]["path"]
+            for path in (self.root / ".cache" / "massive").rglob("*.json")
+        }
+        self.assertEqual(cached_paths, {
+            "/v2/aggs/ticker/SPY/range/1/day/2026-09-09/2026-09-22",
+            "/v1/open-close/WHLR/2026-09-22", "/stocks/v1/splits",
+        })
 
     def test_reentry_exports_two_trades_without_duplicating_candidate_progress(self):
         self.input.write_text("2026-01-05 AAA\n")
@@ -154,7 +212,7 @@ class CLITests(unittest.TestCase):
         self.assertEqual(reentry_months[0]["initial_trades"], "0")
         self.assertEqual(float(reentry_months[0]["net_pnl"]), float(trades[1]["net_pnl"]))
         details = (folder / "4am_short_trade_details.txt").read_text()
-        for text in (details, self.output.getvalue()):
+        for text in (details, self.output.getvalue().rsplit("\n\n", 1)[0]):
             self.assertLess(text.index("Monthly summary - 4am short"), text.index("Re-entry monthly summary - 4am short"))
             self.assertLess(text.index("Re-entry monthly summary - 4am short"), text.index("Trade summary - 4am short"))
             self.assertTrue(text.strip().splitlines()[-1].strip().startswith("Profit factor"))
@@ -215,6 +273,7 @@ class CLITests(unittest.TestCase):
             provider.return_value.previous_close.assert_not_called()
             provider.return_value.minute_bars.assert_not_called()
         self.assertEqual(self.summary()[1]["statistics"]["incomplete"], 1)
+        self.assertEqual(self.output.getvalue().strip().splitlines()[-1], "2026-01-05 | Net P/L: $0.00 (PARTIAL)")
 
     def test_interruption_saves_partial_report(self):
         with patch("four_am_short.cli.MassiveClient") as provider:
@@ -227,7 +286,7 @@ class CLITests(unittest.TestCase):
         self.assertEqual(summary["unprocessed_candidates"], 1)
         self.assertEqual(summary["statistics"]["average_winner_net_pnl"], 1625)
         details = (folder / "4am_short_trade_details.txt").read_text()
-        for text in (details, self.output.getvalue()):
+        for text in (details, self.output.getvalue().rsplit("\n\n", 1)[0]):
             self.assertIn("Trade summary - 4am short (PARTIAL)", text)
             self.assertTrue(text.strip().splitlines()[-1].strip().startswith("Profit factor"))
 

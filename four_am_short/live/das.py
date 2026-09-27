@@ -31,6 +31,10 @@ class DasError(RuntimeError):
     """A failed or unconfirmed DAS operation."""
 
 
+class LocateDeferred(DasError):
+    """Entry eligibility failed and no paid locate command could have been sent."""
+
+
 class OrderRejected(DasError):
     """Exact full submission definitively rejected with no execution evidence."""
 

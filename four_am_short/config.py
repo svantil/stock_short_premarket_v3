@@ -30,8 +30,12 @@ class StrategyConfig:
     gap_percent: float = 30.0
     early_start: str = "04:00"
     early_end: str = "04:15"
+    late_gap_enabled: bool = False
+    late_gap_window_minutes: int = 15
     wait_after_high_minutes: int = 10
     entry_below_high_percent: float = 10.0
+    min_entry_price: float | None = None
+    max_entry_price: float | None = None
     entry_deadline: str = "06:00"
     stop_loss_percent: float = 30.0
     profit_target_percent: float = 12.5
@@ -44,6 +48,17 @@ class StrategyConfig:
     commission_per_share_per_side: float = 0.0
     locate_fee_per_share: float = 0.0
     reentry: ReentryConfig = field(default_factory=ReentryConfig)
+
+    def entry_price_allowed(self, price: float) -> bool:
+        """Whether an entry price is valid and within the inclusive bounds."""
+        return (
+            not isinstance(price, bool)
+            and isinstance(price, (int, float))
+            and math.isfinite(price)
+            and price > 0
+            and (self.min_entry_price is None or price >= self.min_entry_price)
+            and (self.max_entry_price is None or price <= self.max_entry_price)
+        )
 
 
 @dataclass(frozen=True)
@@ -133,21 +148,14 @@ def _path(value: object, base: Path, name: str) -> Path:
     return (base / path).resolve() if not path.is_absolute() else path.resolve()
 
 
-def load_config(path: Path) -> BacktestConfig:
-    path = path.expanduser().resolve()
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError) as exc:
-        raise DataError(f"Cannot read JSON config {path}: {exc}") from exc
-    raw = object_section(raw, {"strategy_id", "strategy_name", "input_file", "output_dir", "shares", "strategy", "data", "from_date", "to_date", "symbols"}, "config")
-    for name, expected in (("strategy_id", STRATEGY_ID), ("strategy_name", STRATEGY_NAME)):
-        if raw.get(name, expected) != expected:
-            raise DataError(f"{name} must be {expected!r} for the 4am short backtest")
-    if "input_file" not in raw:
-        raise DataError("input_file is required")
-    values = object_section(raw.get("strategy", {}), {f.name for f in fields(StrategyConfig)} - {"shares"}, "strategy")
-    values["shares"] = integer(raw.get("shares", 1000), "shares", 1)
+def parse_strategy(raw: object, shares: object = 1000) -> StrategyConfig:
+    """Validate file configuration and recorded strategy snapshots identically."""
+    values = object_section(raw, {f.name for f in fields(StrategyConfig)} - {"shares"}, "strategy")
+    values["shares"] = integer(shares, "shares", 1)
     strategy = asdict(StrategyConfig(**values))
+    if type(strategy["late_gap_enabled"]) is not bool:
+        raise DataError("strategy.late_gap_enabled must be a JSON boolean")
+    integer(strategy["late_gap_window_minutes"], "late_gap_window_minutes", 1)
     for name in ("early_start", "early_end", "entry_deadline", "time_exit"):
         clock(strategy[name], name)
     if not strategy["early_start"] < strategy["early_end"] < strategy["entry_deadline"] <= strategy["time_exit"]:
@@ -155,6 +163,12 @@ def load_config(path: Path) -> BacktestConfig:
     integer(strategy["wait_after_high_minutes"], "wait_after_high_minutes", 0)
     for name in ("gap_percent", "entry_below_high_percent", "stop_loss_percent", "profit_target_percent", "entry_slippage_bps", "exit_slippage_bps", "commission_per_share_per_side", "locate_fee_per_share"):
         strategy[name] = number(strategy[name], name, strict=name in {"stop_loss_percent", "profit_target_percent"})
+    for name in ("min_entry_price", "max_entry_price"):
+        if strategy[name] is not None:
+            strategy[name] = number(strategy[name], f"strategy.{name}", strict=True)
+    if (strategy["min_entry_price"] is not None and strategy["max_entry_price"] is not None
+            and strategy["min_entry_price"] > strategy["max_entry_price"]):
+        raise DataError("Require strategy.min_entry_price <= strategy.max_entry_price")
     for name in ("entry_below_high_percent", "profit_target_percent"):
         if strategy[name] >= 100:
             raise DataError(f"{name} must be less than 100")
@@ -176,6 +190,22 @@ def load_config(path: Path) -> BacktestConfig:
     if not strategy["early_end"] < reentry["entry_deadline"] <= reentry["time_exit"]:
         raise DataError("Require early_end < reentry.entry_deadline <= reentry.time_exit on the same Eastern date")
     strategy["reentry"] = ReentryConfig(**reentry)
+    return StrategyConfig(**strategy)
+
+
+def load_config(path: Path) -> BacktestConfig:
+    path = path.expanduser().resolve()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise DataError(f"Cannot read JSON config {path}: {exc}") from exc
+    raw = object_section(raw, {"strategy_id", "strategy_name", "input_file", "output_dir", "shares", "strategy", "data", "from_date", "to_date", "symbols"}, "config")
+    for name, expected in (("strategy_id", STRATEGY_ID), ("strategy_name", STRATEGY_NAME)):
+        if raw.get(name, expected) != expected:
+            raise DataError(f"{name} must be {expected!r} for the 4am short backtest")
+    if "input_file" not in raw:
+        raise DataError("input_file is required")
+    strategy = parse_strategy(raw.get("strategy", {}), raw.get("shares", 1000))
     data = asdict(DataConfig())
     data.update(object_section(raw.get("data", {}), set(data), "data"))
     for name in ("timeout_seconds", "request_delay_seconds"):
@@ -198,7 +228,7 @@ def load_config(path: Path) -> BacktestConfig:
     return BacktestConfig(
         input_file=_path(raw["input_file"], path.parent, "input_file"),
         output_dir=_path(raw.get("output_dir", f"outcome/{STRATEGY_ID}"), path.parent, "output_dir"),
-        strategy=StrategyConfig(**strategy), data=DataConfig(**data),
+        strategy=strategy, data=DataConfig(**data),
         from_date=start, to_date=end, symbols=tuple(dict.fromkeys(symbol(s) for s in symbols)),
     )
 

@@ -1,4 +1,4 @@
-"""Massive historical prices, with authenticated HTTPS and validated local caches.
+"""Massive historical/intraday prices, with HTTPS and validated local caches.
 
 All prices are as traded (``adjusted=false``). Only the prior regular close is
 normalized for share changes effective on the requested trading date.
@@ -284,8 +284,8 @@ class MassiveClient:
         if not isinstance(pages, list) or not pages:
             raise DataError("Massive response has no complete pages")
         for page in pages:
-            if not isinstance(page, dict) or page.get("status") != "OK":
-                raise DataError("Massive API did not return status OK")
+            if not isinstance(page, dict) or page.get("status") not in ("OK", "DELAYED"):
+                raise DataError("Massive API did not return status OK or DELAYED")
             if "next_url" in page:
                 raise DataError("Massive cache contains unfinished pagination")
 
@@ -298,8 +298,9 @@ class MassiveClient:
                 raise DataError("Massive pagination did not terminate")
             seen.add(url)
             page = self._request_json(url)
-            if not isinstance(page, dict) or page.get("status") != "OK":
-                raise DataError("Massive API did not return status OK")
+            # Intraday aggregates on delayed plans contain valid bars with this status.
+            if not isinstance(page, dict) or page.get("status") not in ("OK", "DELAYED"):
+                raise DataError("Massive API did not return status OK or DELAYED")
             next_url = page.pop("next_url", None)
             pages.append(page)
             url = _safe_url(next_url) if next_url else ""

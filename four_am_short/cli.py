@@ -13,7 +13,7 @@ from .config import iso_date, load_config, read_api_key, symbol
 from .inputs import read_candidates
 from .massive import MassiveClient
 from .models import EASTERN, DataError, TradeResult
-from .reports import format_gap_summary, format_monthly_summary, format_trade_summary, write_reports
+from .reports import format_gap_summary, format_monthly_summary, format_trade_summary, summarize, write_reports
 from .strategy import simulate_trades
 from .trade_details import format_candidate
 
@@ -93,6 +93,12 @@ def main(argv: list[str] | None = None) -> int:
         if config.strategy.reentry.enabled:
             print("\n" + format_monthly_summary(rows, partial=interrupted, reentry_only=True))
         print("\n" + format_trade_summary(rows, partial=interrupted))
+        today = datetime.now(EASTERN).date().isoformat()
+        today_rows = [row for row in rows if row.date == today]
+        today_stats = summarize(today_rows)
+        today_pnl = f"${today_stats['net_pnl']:,.2f}" if today_rows else "--"
+        partial = " (PARTIAL)" if interrupted or today_stats["errors"] or today_stats["incomplete"] else ""
+        print(f"\n{today} | Net P/L: {today_pnl}{partial}")
         if interrupted:
             return 130
         return 3 if stats["errors"] or stats["incomplete"] else 0

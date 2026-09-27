@@ -15,19 +15,24 @@ import logging
 import math
 import sys
 from datetime import date, datetime, time, timedelta
-from decimal import Decimal, ROUND_CEILING
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from .. import STRATEGY_NAME
 from ..config import load_config
 from ..models import Bar, EASTERN
+from ..pricing import order_price
+from ..setups import select_setup
+from . import audit
 from .config import PROJECT, LiveSettings
-from .das import DasClient, DasError, OrderRejected, OrderSubmissionUncertain, TERMINAL_STATUSES
+from .das import DasClient, DasError, LocateDeferred, OrderRejected, OrderSubmissionUncertain, TERMINAL_STATUSES
 from .data import AlpacaData, SIPFeed
 from .store import StateStore
 
 LOGGER = logging.getLogger(__name__)
+LOCATE_RETRY_SECONDS = 30
 
 
 def at(day: date, clock: str) -> datetime:
@@ -43,11 +48,6 @@ def stamp(value: str | datetime) -> datetime:
 
 def percent(price: float, offset: float) -> float:
     return float(Decimal(str(price)) * (1 + Decimal(str(offset)) / 100))
-
-
-def order_price(price: float) -> float:
-    tick = Decimal("0.01") if price >= 1 else Decimal("0.0001")
-    return float(Decimal(str(price)).quantize(tick, rounding=ROUND_CEILING))
 
 
 def _positive(value: Any) -> float:
@@ -74,12 +74,16 @@ class LiveEngine:
         self._tasks: list[asyncio.Task] = []
         self._bootstrap_task: asyncio.Task | None = None
         self._finalize_task: asyncio.Task | None = None
+        self._late_finalize_task: asyncio.Task | None = None
         self._entry_task: asyncio.Task | None = None
         self._entry_symbol = ""
         self._backtest_task: asyncio.Task | None = None
         self._tick_lock = asyncio.Lock()
         self._quotes: dict[str, dict] = {}
         self._bars: dict[str, dict[str, Bar]] = {}
+        self._setup_bars: dict[str, tuple[Bar, ...]] = {}
+        self._audit_session_id = uuid4().hex
+        self._audit_recorded_days: set[str] = set()
         self._closes: dict[str, float] = {}
         self._symbols: list[str] = []
         self._day = self.now().astimezone(EASTERN).date()
@@ -90,6 +94,7 @@ class LiveEngine:
         self._subscriptions: set[str] = set()
         self._bootstrap_retry_at: datetime | None = None
         self._finalize_retry_at: datetime | None = None
+        self._late_finalize_retry_at: datetime | None = None
         self._locate_service_task: asyncio.Task | None = None
         self._locate_service_at: datetime | None = None
         self._broker_health_task: asyncio.Task | None = None
@@ -106,11 +111,84 @@ class LiveEngine:
         self.backtest: dict = {"running": False, "error": None, "last_output": "", "latest_summary": None, "monthly": [], "reports_dir": None}
 
     def _day_state(self, day: date | None = None) -> dict:
-        return self.state["days"].setdefault(str(day or self._day), {"candidates": {}, "trades": {}})
+        key = str(day or self._day)
+        value = self.state["days"].setdefault(key, {"candidates": {}, "trades": {}})
+        if key == str(self._day) and key not in self._audit_recorded_days:
+            try:
+                execution = {name: getattr(self.settings, name) for name in (
+                    "final_bar_wait_seconds", "locate_trigger_below_entry_percent", "max_locate_price",
+                    "max_positions", "cover_cushion_percent")}
+                execution["quote_max_age_seconds"] = self.settings.data.quote_max_age_seconds
+                session = audit.session_snapshot(self._audit_session_id, self.now(), self.settings.strategy,
+                                                 self._data_status.get("previous_close_date"), execution)
+                daily = value.setdefault("audit", {"schema": audit.SCHEMA, "data_feed": audit.DATA_FEED,
+                                                  "started_at": session["started_at"],
+                                                  "strategy": session["strategy"],
+                                                  "previous_close_date": session["previous_close_date"], "sessions": []})
+                daily.setdefault("sessions", []).append(session)
+                self._dirty = True
+            except Exception:
+                # Optional diagnostics must never prevent position supervision.
+                LOGGER.warning("Could not capture live session evidence")
+            self._audit_recorded_days.add(key)
+        return value
+
+    def _record_entry_evidence(self, trade: dict, candidate: dict) -> None:
+        try:
+            symbol = trade["symbol"]
+            end = stamp(candidate["window_end"]) if candidate.get("window_end") else at(self._day, self.settings.strategy.early_end)
+            bars = self._setup_bars.get(symbol)
+            source = "frozen_setup"
+            if bars is None:
+                bars = tuple(bar for bar in self._bars.get(symbol, {}).values()
+                             if at(self._day, self.settings.strategy.early_start) <= bar.timestamp < end)
+                source = "current_memory" if bars else "unavailable"
+            frozen = {**candidate, "entry_limit": trade["entry_limit"], "entry_deadline": trade["entry_deadline"],
+                      "active_at": trade["active_at"], "time_exit": trade["time_exit"],
+                      "stop_percent": trade["stop_percent"], "target_percent": trade["target_percent"]}
+            evidence = audit.entry_snapshot(
+                session_id=self._audit_session_id, now=self.now(), strategy=self.settings.strategy,
+                candidate=frozen, previous_close_date=self._data_status.get("previous_close_date"),
+                quote=self._fresh_quote(symbol), bars=bars, bars_source=source,
+                window_finalized=bool(candidate.get("window_finalized") if candidate.get("late_gap") else self._window_finalized),
+                early_window_finalized=self._window_finalized)
+            if trade.get("trade_number", 1) == 2:
+                primary = self._day_state()["trades"].get(symbol, {}).get("entry_evidence", {})
+                if primary.get("setup_bars"):
+                    # Re-entry uses the original frozen high, including after a
+                    # restart when a REST refresh may contain revised bars.
+                    evidence.update(setup_bars=[dict(row) for row in primary["setup_bars"]],
+                                    setup_bars_source="primary_entry_evidence",
+                                    previous_close=primary.get("previous_close"),
+                                    previous_close_date=primary.get("previous_close_date"))
+            trade.setdefault("entry_evidence", evidence)
+            trade.setdefault("entry_attempt_evidence", []).append(evidence)
+            self._dirty = True
+        except Exception:
+            LOGGER.warning("Could not capture live entry evidence")
+
+    def _record_exit_evidence(self, trade: dict, reason: str, quote: dict | None = None) -> None:
+        if trade.get("exit_signal_evidence"):
+            return
+        try:
+            trade["exit_signal_evidence"] = audit.exit_snapshot(
+                session_id=self._audit_session_id, now=self.now(), trade=trade, reason=reason,
+                quote=quote if quote is not None else self._fresh_quote(trade["symbol"]))
+            self._dirty = True
+        except Exception:
+            LOGGER.warning("Could not capture live exit evidence")
 
     def _trades(self, *, active: bool = False) -> list[dict]:
         values = [trade for day in self.state["days"].values() for trade in day["trades"].values()]
-        return [trade for trade in values if trade["status"] not in {"closed", "skipped"}] if active else values
+        return [trade for trade in values if trade["status"] not in {"closed", "skipped", "locate_deferred"}] if active else values
+
+    def _expire_deferred_locates(self) -> None:
+        for trade in self._trades():
+            if trade["status"] == "locate_deferred" and self.now() >= stamp(trade["entry_deadline"]):
+                note = "Entry deadline passed after unpaid locate deferral; no stock order sent"
+                trade.update(status="skipped", note=note,
+                             locate={**trade.get("locate", {}), "status": "not_purchased", "note": note})
+                self._dirty = True
 
     def _safe_error(self, error: Exception | str) -> str:
         text = str(error)
@@ -246,6 +324,7 @@ class LiveEngine:
         self._opened = True
         self._day_state()
         self._load_latest_backtest()
+        self._expire_deferred_locates()
         for trade in self._trades(active=True):
             # A crash while arranging borrow must never automatically buy it again.
             if trade["status"] == "locating" and not trade.get("entry_token"):
@@ -299,19 +378,33 @@ class LiveEngine:
             return
         self._bootstrap_task = asyncio.create_task(self._bootstrap(), name="4am-discovery")
 
-    def _replace_window(self, history: dict[str, list[Bar]]) -> None:
+    def _replace_window(self, history: dict[str, list[Bar]], *, preserve_from: datetime | None = None) -> None:
         # A successful complete REST snapshot is authoritative. Old persisted
         # candidates must not survive missing bars or a missing prior close.
         trades = self._day_state()["trades"]
+        # Rebuild every unconsumed setup, including a later setup which may
+        # become an original-window qualifier after corrected history arrives.
         self._day_state()["candidates"] = {symbol: row for symbol, row in self._day_state()["candidates"].items() if symbol in trades}
+        self._setup_bars = {symbol: bars for symbol, bars in self._setup_bars.items() if symbol in trades}
+        # The REST endpoint is exclusive. Preserve later websocket minutes
+        # received while the request was in flight, but replace its covered
+        # interval so stale bars cannot keep a removed qualification alive.
+        retained = {symbol: [bar for bar in bars.values() if preserve_from is not None and bar.timestamp >= preserve_from]
+                    for symbol, bars in self._bars.items()}
         self._bars = {}
         for symbol, bars in history.items():
+            if symbol in self._closes:
+                for bar in bars:
+                    self._accept_bar(symbol, bar, historical=True)
+        for symbol, bars in retained.items():
             if symbol in self._closes:
                 for bar in bars:
                     self._accept_bar(symbol, bar, historical=True)
         self._dirty = True
 
     async def _bootstrap(self) -> None:
+        if self._late_finalize_task and not self._late_finalize_task.done():
+            self._late_finalize_task.cancel()
         self._data_status.update(backfill_ready=False, status="Loading Alpaca universe and prior regular closes")
         self._window_finalized = False
         try:
@@ -323,6 +416,17 @@ class LiveEngine:
             self._symbols = [symbol for symbol in result.symbols if not self.settings.symbols or symbol in self.settings.symbols]
             self._closes = {symbol: result.previous_closes[symbol] for symbol in self._symbols if symbol in result.previous_closes}
             self._data_status.update(universe_size=len(self._symbols), previous_close_date=str(result.previous_close_date) if result.previous_close_date else None)
+            try:
+                daily_audit = self._day_state()["audit"]
+                previous_date = self._data_status["previous_close_date"]
+                if daily_audit.get("previous_close_date") is None:
+                    daily_audit["previous_close_date"] = previous_date
+                for session in daily_audit.get("sessions", []):
+                    if session.get("session_id") == self._audit_session_id:
+                        session["previous_close_date"] = previous_date
+                self._dirty = True
+            except Exception:
+                LOGGER.warning("Could not capture previous-close date evidence")
             for warning in result.warnings[:10]:
                 self._event(warning, "warning")
             if not self._market_day:
@@ -331,12 +435,15 @@ class LiveEngine:
                 return
             rules = self.settings.strategy
             current = self.now().astimezone(EASTERN)
-            end = min(at(day, rules.early_end), current.replace(second=0, microsecond=0))
+            discovery_end = rules.entry_deadline if rules.late_gap_enabled else rules.early_end
+            end = min(at(day, discovery_end), current.replace(second=0, microsecond=0))
             if end > at(day, rules.early_start):
                 history = await self.data.backfill(self._symbols, day, rules.early_start, end.strftime("%H:%M"))
                 if self._day != day:
                     return
-                if end == at(day, rules.early_end):
+                if rules.late_gap_enabled:
+                    self._replace_window(history, preserve_from=end)
+                elif end == at(day, rules.early_end):
                     self._replace_window(history)
                 else:
                     # Preserve websocket minutes arriving while the partial
@@ -347,11 +454,13 @@ class LiveEngine:
                             self._accept_bar(symbol, bar, historical=True)
             for symbol in list(self._bars):
                 self._rebuild_candidate(symbol)
-            self._data_status.update(backfill_ready=True, status="SIP discovery ready; collecting the early window")
+            if rules.late_gap_enabled:
+                self._mark_late_windows_finalized(end, verified_at=current)
+            self._data_status.update(backfill_ready=True, status="SIP discovery ready; collecting premarket setups" if rules.late_gap_enabled else "SIP discovery ready; collecting the early window")
             self._bootstrap_retry_at = None
             if current >= at(day, rules.early_end) + timedelta(seconds=self.settings.final_bar_wait_seconds):
                 self._window_finalized = True
-                self._data_status["status"] = "Early window loaded; watching entries and exits"
+                self._data_status["status"] = "Early window loaded; scanning later gaps and watching entries and exits" if rules.late_gap_enabled else "Early window loaded; watching entries and exits"
             await self._sync_subscriptions()
             self._persist()
         except asyncio.CancelledError:
@@ -368,10 +477,10 @@ class LiveEngine:
             history = await self.data.backfill(self._symbols, day, rules.early_start, rules.early_end)
             if self._day != day:
                 return
-            self._replace_window(history)
+            self._replace_window(history, preserve_from=at(day, rules.early_end) if rules.late_gap_enabled else None)
             self._window_finalized = True
             self._finalize_retry_at = None
-            self._data_status["status"] = "Early window finalized; watching entries and exits"
+            self._data_status["status"] = "Early window finalized; scanning later gaps and watching entries and exits" if rules.late_gap_enabled else "Early window finalized; watching entries and exits"
             self._event("Early window finalized from Alpaca SIP bars")
             await self._sync_subscriptions()
             self._persist()
@@ -381,6 +490,51 @@ class LiveEngine:
             self._data_status["status"] = "Final early-window backfill failed; entries paused"
             self._event(self._safe_error(exc), "error")
             self._finalize_retry_at = self.now() + timedelta(seconds=max(5, self.settings.data.reconnect_seconds))
+
+    def _mark_late_windows_finalized(self, covered_until: datetime, *, symbol: str | None = None,
+                                     covered_from: datetime | None = None, verified_at: datetime | None = None) -> None:
+        """Authorize only complete observation windows verified by REST."""
+        for candidate in self._day_state()["candidates"].values():
+            if not candidate.get("late_gap") or (symbol is not None and candidate["symbol"] != symbol):
+                continue
+            end = stamp(candidate["window_end"])
+            if (end <= covered_until and (covered_from is None or stamp(candidate["first_gap_time"]) >= covered_from)
+                    and (verified_at or self.now()) >= end + timedelta(seconds=self.settings.final_bar_wait_seconds)):
+                candidate["window_finalized"] = True
+                self._dirty = True
+
+    async def _finalize_late_windows(self) -> None:
+        """Refresh each mature later setup before permitting its first entry."""
+        day = self._day
+        try:
+            for pending in list(self._day_state()["candidates"].values()):
+                if not pending.get("late_gap") or pending.get("window_finalized"):
+                    continue
+                symbol = pending["symbol"]
+                start, end = stamp(pending["first_gap_time"]), stamp(pending["window_end"])
+                if (symbol in self._day_state()["trades"] or self.now() >= self._candidate_deadline(pending)
+                        or self.now() < end + timedelta(seconds=self.settings.final_bar_wait_seconds)):
+                    continue
+                history = await self.data.backfill([symbol], day, start.strftime("%H:%M"), end.strftime("%H:%M"))
+                if self._day != day:
+                    return
+                if symbol in self._day_state()["trades"]:
+                    continue
+                self._day_state()["candidates"].pop(symbol, None)
+                self._bars[symbol] = {key: bar for key, bar in self._bars.get(symbol, {}).items()
+                                      if not start <= bar.timestamp < end}
+                for bar in history.get(symbol, []):
+                    self._accept_bar(symbol, bar, historical=True)
+                self._rebuild_candidate(symbol)
+                self._mark_late_windows_finalized(end, symbol=symbol, covered_from=start)
+            self._late_finalize_retry_at = None
+            await self._sync_subscriptions()
+            self._persist()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._event(f"Later setup backfill failed; its entries remain paused: {self._safe_error(exc)}", "error")
+            self._late_finalize_retry_at = self.now() + timedelta(seconds=max(5, self.settings.data.reconnect_seconds))
 
     async def on_status(self, status: dict) -> None:
         was_ready = bool(self._data_status.get("ready"))
@@ -423,6 +577,8 @@ class LiveEngine:
                 # Remember a stop/target touch even if the quote changes while a
                 # serialized DAS request is running in the supervisor.
                 for trade in self._trades(active=True):
+                    if trade["symbol"] == symbol:
+                        self._cancel_entry_outside_price_range(trade, self._fresh_quote(symbol))
                     if trade["symbol"] == symbol and trade["entry_filled_qty"] and not trade.get("exit_reason"):
                         reason = self._exit_signal(trade)
                         if reason:
@@ -440,11 +596,12 @@ class LiveEngine:
         rules = self.settings.strategy
         if timestamp.date() != self._day or timestamp.second or timestamp.microsecond:
             return
-        if not at(self._day, rules.early_start) <= timestamp < at(self._day, rules.early_end):
+        discovery_end = rules.entry_deadline if rules.late_gap_enabled else rules.early_end
+        if not at(self._day, rules.early_start) <= timestamp < at(self._day, discovery_end):
             return
         if timestamp + timedelta(minutes=1) > self.now():
             return
-        if self._window_finalized and not historical:
+        if self._window_finalized and not historical and (not rules.late_gap_enabled or timestamp < at(self._day, rules.early_end)):
             return
         self._bars.setdefault(symbol, {})[timestamp.isoformat()] = bar
         self._rebuild_candidate(symbol)
@@ -453,26 +610,29 @@ class LiveEngine:
         previous = self._closes.get(symbol)
         if previous is None or symbol in self._day_state()["trades"]:
             return
+        existing = self._day_state()["candidates"].get(symbol, {})
+        if existing.get("late_gap") and existing.get("window_finalized"):
+            return
         rules = self.settings.strategy
         bars = sorted(self._bars.get(symbol, {}).values(), key=lambda bar: bar.timestamp)
         threshold = percent(previous, rules.gap_percent)
-        qualifying = [bar for bar in bars if Decimal(str(bar.high)) > Decimal(str(threshold))]
-        if not qualifying:
+        setup = select_setup(self._day, bars, previous, rules)
+        if setup is None:
             self._day_state()["candidates"].pop(symbol, None)
+            self._setup_bars.pop(symbol, None)
             return
-        high = max(bar.high for bar in bars)
-        high_bars = [bar for bar in bars if bar.high == high]
-        high_bar = high_bars[-1] if rules.repeated_high_policy == "last" else high_bars[0]
-        high_time = high_bar.timestamp + (timedelta(minutes=1) if rules.high_time_reference == "bar_end" else timedelta())
-        active = max(at(self._day, rules.early_end), high_time + timedelta(minutes=rules.wait_after_high_minutes))
-        existing = self._day_state()["candidates"].get(symbol, {})
+        high_bar, high_time, active = setup.high_bar, setup.high_time, setup.active_at
+        high = high_bar.high
         candidate = {**existing, "symbol": symbol, "date": str(self._day), "previous_close": previous,
-                     "gap_threshold": threshold, "first_gap_time": qualifying[0].timestamp.isoformat(),
-                     "first_gap_bar_high": qualifying[0].high, "early_high": high,
+                     "gap_threshold": threshold, "first_gap_time": setup.first_gap_bar.timestamp.isoformat(),
+                     "first_gap_bar_high": setup.first_gap_bar.high, "early_high": high, "late_gap": setup.late_gap,
                      "early_high_bar_time": high_bar.timestamp.isoformat(), "early_high_time": high_time.isoformat(),
+                     "window_end": setup.window_end.isoformat(), "window_finalized": False,
                      "active_at": active.isoformat(), "entry_limit": order_price(percent(high, -rules.entry_below_high_percent)),
-                     "status": "waiting", "note": "Waiting for the early window and high delay", "locate": {}}
+                     "status": "waiting", "note": "Waiting for the high delay" if setup.late_gap else "Waiting for the early window and high delay", "locate": {}}
         self._day_state()["candidates"][symbol] = candidate
+        self._setup_bars[symbol] = tuple(bar for bar in bars
+                                         if at(self._day, rules.early_start) <= bar.timestamp < setup.window_end)
         self._dirty = True
 
     def _fresh_quote(self, symbol: str) -> dict | None:
@@ -483,6 +643,27 @@ class LiveEngine:
         if age < -self.settings.data.future_tolerance_seconds or age > self.settings.data.quote_max_age_seconds:
             return None
         return quote
+
+    def _entry_price_block_reason(self, price: float, label: str) -> str | None:
+        rules = self.settings.strategy
+        if rules.entry_price_allowed(price):
+            return None
+        if rules.min_entry_price is not None and price < rules.min_entry_price:
+            return f"{label} ${price:g} below minimum entry price ${rules.min_entry_price:g}"
+        if rules.max_entry_price is not None and price > rules.max_entry_price:
+            return f"{label} ${price:g} above maximum entry price ${rules.max_entry_price:g}"
+        return f"{label} is not a valid entry price"
+
+    def _cancel_entry_outside_price_range(self, trade: dict, quote: dict | None = None) -> None:
+        """Latch cancellation of the unfilled remainder; never discard fills."""
+        if trade.get("entry_terminal") or trade["status"] == "locating":
+            return
+        reason = self._entry_price_block_reason(trade["entry_limit"], "Entry limit")
+        if not reason and quote:
+            reason = self._entry_price_block_reason(quote["bid"], "Bid")
+        if reason and not trade.get("entry_cancel_reason"):
+            trade.update(cancel_entry=True, entry_cancel_reason=reason)
+            self._dirty = True
 
     async def _sync_subscriptions(self) -> None:
         symbols = {trade["symbol"] for trade in self._trades(active=True)}
@@ -496,30 +677,74 @@ class LiveEngine:
             await self.feed.set_symbols(symbols)
             self._subscriptions = symbols
 
-    def _can_enter(self, candidate: dict) -> bool:
+    def _eligibility(self, candidate: dict, *, locate: bool = False) -> dict:
+        """Capture the exact gate and quote used, including during a DAS wait."""
         now = self.now()
-        if not (self.running and self.entries_enabled and not self._entry_block and self._market_day and
-                self._window_finalized and self._data_status.get("ready") and self._data_status.get("backfill_ready")):
-            return False
+        quote = self._quotes.get(candidate["symbol"])
+        age = (now - stamp(quote["timestamp"])).total_seconds() if quote else None
+        trigger = self._locate_trigger_price(candidate) if locate and candidate.get("trade_number", 1) == 1 else None
+        details = {"checked_at": now.isoformat(), "bid": quote["bid"] if quote else None,
+                   "ask": quote["ask"] if quote else None,
+                   "quote_timestamp": quote["timestamp"] if quote else None,
+                   "quote_age_seconds": round(age, 3) if age is not None else None,
+                   "trigger_price": trigger, "min_entry_price": self.settings.strategy.min_entry_price,
+                   "max_entry_price": self.settings.strategy.max_entry_price, "reason": None}
+
+        def blocked(reason: str) -> dict:
+            return {**details, "reason": reason}
+
+        if not self.running or self._closing:
+            return blocked("Supervisor stopped or shutting down")
+        if not self.entries_enabled:
+            return blocked("New entries paused")
+        if self._entry_block:
+            return blocked(self._entry_block)
+        if not self._market_day:
+            return blocked("Market session not ready")
+        if not self._window_finalized or (candidate.get("late_gap") and not candidate.get("window_finalized", False)):
+            return blocked("Setup window not finalized")
+        if not self._data_status.get("ready") or not self._data_status.get("backfill_ready"):
+            return blocked("SIP feed or historical backfill not ready")
         if not self._broker_ready():
-            return False
+            return blocked("DAS connection not verified")
         if candidate["date"] != str(now.astimezone(EASTERN).date()):
-            return False
+            return blocked("Setup belongs to a different trading date")
         if candidate["symbol"] not in self._closes or candidate["symbol"] not in self._symbols:
-            return False
-        quote = self._fresh_quote(candidate["symbol"])
+            return blocked("Symbol or previous close unavailable")
+        if candidate.get("trade_number", 1) == 1 and candidate["symbol"] not in self._day_state()["trades"]:
+            current = self._day_state()["candidates"].get(candidate["symbol"])
+            if current is None or any(current.get(key) != candidate.get(key) for key in (
+                    "early_high", "active_at", "entry_limit", "first_gap_time", "window_end", "window_finalized", "late_gap")):
+                return blocked("Setup changed before entry")
+        if now >= self._candidate_deadline(candidate):
+            return blocked("Entry deadline passed")
+        if now < stamp(candidate["active_at"]):
+            return blocked("Waiting for the setup window and high delay")
+        price_reason = self._entry_price_block_reason(candidate["entry_limit"], "Entry limit")
+        if price_reason:
+            return blocked(price_reason)
         if not quote:
-            return False
+            return blocked("No SIP quote available")
+        if age < -self.settings.data.future_tolerance_seconds:
+            return blocked(f"SIP quote is {-age:.2f}s in the future")
+        if age > self.settings.data.quote_max_age_seconds:
+            return blocked(f"SIP quote is {age:.2f}s old; maximum {self.settings.data.quote_max_age_seconds:g}s")
+        price_reason = self._entry_price_block_reason(quote["bid"], "Bid")
+        if price_reason:
+            return blocked(price_reason)
         if candidate.get("trade_number", 1) == 2:
             primary = self._day_state()["trades"].get(candidate["symbol"])
             if not self.settings.strategy.reentry.enabled or not primary or not self._primary_stopped_flat(primary):
-                return False
+                return blocked("Initial stop-loss position is not confirmed flat or re-entry is disabled")
             flat_at = primary.get("flat_confirmed_at") or primary.get("exit_time")
             if not flat_at or stamp(quote["timestamp"]) < stamp(flat_at):
-                return False
-        if not stamp(candidate["active_at"]) <= now < self._candidate_deadline(candidate):
-            return False
-        return True
+                return blocked("Waiting for a quote after the initial position closed")
+        if trigger is not None and Decimal(str(quote["bid"])) < Decimal(str(trigger)):
+            return blocked(f"Bid ${quote['bid']:g} below locate trigger ${trigger:g}")
+        return details
+
+    def _can_enter(self, candidate: dict) -> bool:
+        return self._eligibility(candidate)["reason"] is None
 
     def _locate_trigger_price(self, candidate: dict) -> float | None:
         distance = self.settings.locate_trigger_below_entry_percent
@@ -532,13 +757,7 @@ class LiveEngine:
         borrow is confirmed, the ordinary entry rules control the resting order;
         a later price fade must not discard borrow we have already paid for.
         """
-        if not self._can_enter(candidate):
-            return False
-        if candidate.get("trade_number", 1) == 2:
-            return True  # Reuse confirmed borrow; never wait on a paid-locate price gate.
-        trigger = self._locate_trigger_price(candidate)
-        quote = self._fresh_quote(candidate["symbol"])
-        return quote is not None and (trigger is None or Decimal(str(quote["bid"])) >= Decimal(str(trigger)))
+        return self._eligibility(candidate, locate=True)["reason"] is None
 
     async def _supervise(self) -> None:
         while not self._stop.is_set():
@@ -559,20 +778,23 @@ class LiveEngine:
             self._schedule_broker_health()
             today = self.now().astimezone(EASTERN).date()
             if today != self._day:
-                for task in (self._bootstrap_task, self._finalize_task):
+                for task in (self._bootstrap_task, self._finalize_task, self._late_finalize_task):
                     if task and not task.done():
                         task.cancel()
-                self._bootstrap_task = self._finalize_task = None
-                self._bootstrap_retry_at = self._finalize_retry_at = None
+                self._bootstrap_task = self._finalize_task = self._late_finalize_task = None
+                self._bootstrap_retry_at = self._finalize_retry_at = self._late_finalize_retry_at = None
                 self._day = today
                 self._bars, self._closes, self._symbols = {}, {}, []
+                self._setup_bars = {}
                 self._window_finalized = False
                 self._market_day = False
                 self._data_status["backfill_ready"] = False
+                self._data_status["previous_close_date"] = None
                 self._day_state()
                 self._launch_bootstrap()
             if self.running and not self._closing and not self._data_status.get("backfill_ready") and (self._bootstrap_retry_at is None or self.now() >= self._bootstrap_retry_at):
                 self._launch_bootstrap()
+            self._expire_deferred_locates()
             # Exit supervision always runs, including after Stop Entries.
             for trade in self._trades(active=True):
                 if trade["status"] == "locating":
@@ -598,15 +820,37 @@ class LiveEngine:
                 finish = at(self._day, self.settings.strategy.early_end) + timedelta(seconds=self.settings.final_bar_wait_seconds)
                 if self.now() >= finish and (self._finalize_retry_at is None or self.now() >= self._finalize_retry_at) and (self._finalize_task is None or self._finalize_task.done()) and (self._bootstrap_task is None or self._bootstrap_task.done()):
                     self._finalize_task = asyncio.create_task(self._finalize_window(), name="4am-final-bars")
+            if (self.settings.strategy.late_gap_enabled and self._market_day and self._data_status.get("backfill_ready")
+                    and not self._closing and self.now() < at(self._day, self.settings.strategy.entry_deadline)
+                    and (self._late_finalize_retry_at is None or self.now() >= self._late_finalize_retry_at)
+                    and all(task is None or task.done() for task in (self._bootstrap_task, self._finalize_task, self._late_finalize_task))):
+                mature = any(candidate.get("late_gap") and not candidate.get("window_finalized")
+                             and candidate["symbol"] not in self._day_state()["trades"]
+                             and self.now() >= stamp(candidate["window_end"]) + timedelta(seconds=self.settings.final_bar_wait_seconds)
+                             for candidate in self._day_state()["candidates"].values())
+                if mature:
+                    self._late_finalize_task = asyncio.create_task(self._finalize_late_windows(), name="4am-later-final-bars")
             await self._sync_subscriptions()
             candidates = list(self._day_state()["candidates"].values())
             candidates += [candidate for primary in list(self._day_state()["trades"].values())
                            if (candidate := self._reentry_candidate(primary)) is not None]
             for candidate in candidates:
-                if self._trade_key(candidate) in self._day_state()["trades"]:
+                previous = self._day_state()["trades"].get(self._trade_key(candidate))
+                if previous and previous["status"] != "locate_deferred":
                     continue
                 if self.now() >= self._candidate_deadline(candidate):
                     candidate.update(status="expired", note="Entry deadline passed")
+                    continue
+                if previous and self.now() < stamp(previous["locate_retry_after"]):
+                    continue
+                price_reason = self._entry_price_block_reason(candidate["entry_limit"], "Entry limit")
+                if price_reason:
+                    candidate.update(status="price_filtered", note=price_reason)
+                    continue
+                quote = self._fresh_quote(candidate["symbol"])
+                price_reason = self._entry_price_block_reason(quote["bid"], "Bid") if quote else None
+                if price_reason:
+                    candidate.update(status="waiting_for_price", note=price_reason)
                     continue
                 if not self._can_enter(candidate):
                     candidate["status"] = "waiting"
@@ -714,12 +958,33 @@ class LiveEngine:
         symbol = candidate["symbol"]
         key = self._trade_key(candidate)
         reentry = candidate.get("trade_number", 1) == 2
-        if not self._can_locate(candidate) or key in self._day_state()["trades"]:
+        previous = self._day_state()["trades"].get(key)
+        if not self._can_locate(candidate):
+            return
+        if previous and (previous["status"] != "locate_deferred" or reentry
+                         or previous.get("entry_token") or previous.get("entry_filled_qty")
+                         or previous.get("reconciliation_required")
+                         or self.now() >= stamp(previous["entry_deadline"])
+                         or self.now() < stamp(previous["locate_retry_after"])):
             return
         trade = self._new_trade(candidate)
+        if previous:
+            # A retry continues the same frozen setup and original deadline.
+            trade = {**previous, "status": "locating", "note": "Rechecking account and unpaid locate", "cancel_entry": False}
         self._day_state()["trades"][key] = trade
         candidate["status"] = "locating"
-        self._persist()  # The stock/day is consumed before any possible locate charge.
+        self._record_entry_evidence(trade, candidate)
+        self._persist()  # Reserve the stock/day before any possible locate charge.
+        locate_started = False
+        eligibility: dict = {}
+        entry_candidate = {**candidate, "entry_deadline": trade["entry_deadline"],
+                           "active_at": trade["active_at"], "entry_limit": trade["entry_limit"]}
+
+        def still_valid() -> bool:
+            nonlocal eligibility
+            eligibility = self._eligibility(entry_candidate, locate=True)
+            return eligibility["reason"] is None
+
         try:
             if not self.settings.execution_enabled:
                 trade.update(status="entry_pending", note="Monitor mode: simulated resting sell limit", locate={"status": "not_requested", "note": "Monitor mode never connects to DAS"})
@@ -734,17 +999,18 @@ class LiveEngine:
                 return
             if reentry:
                 await self._verify_primary_closed(self._day_state()["trades"][symbol])
-            if not self._can_locate(candidate):
-                trade.update(status="skipped", note="Entry conditions or locate-price proximity changed before borrowing; no locate requested")
-                return
+            if not still_valid():
+                # Account checks are read-only; no borrow request has begun.
+                raise LocateDeferred("Entry conditions changed before borrowing; no locate requested")
             if reentry:
                 success, note = await asyncio.to_thread(self.broker.validate_shortable, symbol, trade["requested_qty"])
                 route, fee = "existing", 0.0
                 note = f"Re-entry: {note}; no new locate purchase"
             else:
+                locate_started = True
                 success, note, route, fee = await asyncio.to_thread(
                     self.broker.ensure_shortable, symbol, trade["requested_qty"], self.settings.max_locate_price,
-                    still_valid=lambda: self._can_locate(candidate))
+                    still_valid=still_valid)
             trade["locate"] = {"status": ("reused" if reentry else "available") if success else "unavailable", "note": note,
                                "route": route, "fee_per_share": fee,
                                "comparisons": getattr(self.broker, "locate_comparisons", {}).get(symbol, [])}
@@ -754,18 +1020,19 @@ class LiveEngine:
                 trade.update(status="skipped", note=note)
                 return
             # Locate latency must not extend the entry deadline or a pause.
-            if not self._can_enter(candidate):
-                trade.update(status="skipped", note="Entry conditions changed after borrowing; locate may remain unused")
+            if not self._can_enter(entry_candidate):
+                trade.update(status="skipped", note=f"{self._eligibility(entry_candidate)['reason']}; entry conditions changed after borrowing; locate may remain unused")
                 return
             position = await asyncio.to_thread(self.broker.position_qty, symbol)
             orders = await asyncio.to_thread(self.broker.list_open_orders, symbol)
-            if position != 0 or orders or not self._can_enter(candidate):
+            if position != 0 or orders or not self._can_enter(entry_candidate):
                 trade.update(status="skipped", note="Account or quote changed before submission; no stock order sent")
                 return
             routes = [route for route in (self.settings.das.route, self.settings.das.backup_route) if route]
             for route_index, route in enumerate(routes):
-                if not self._can_enter(candidate):
-                    trade.update(status="skipped", note="Entry expired or paused before stock submission")
+                if trade["cancel_entry"] or not self._can_enter(entry_candidate):
+                    note = trade.get("entry_cancel_reason") or self._eligibility(entry_candidate)["reason"] or "Entry canceled"
+                    trade.update(status="skipped", note=f"{note}; no stock order sent")
                     return
                 token = self.broker.new_client_order_id()
                 trade.update(entry_token=token, entry_route=route, status="entry_pending", note=f"Submitting resting sell limit via {route}")
@@ -773,7 +1040,7 @@ class LiveEngine:
                 try:
                     order = await asyncio.to_thread(self.broker.submit_limit_order, symbol=symbol, qty=trade["requested_qty"],
                                                     side="sell", limit_price=trade["entry_limit"], client_order_id=token, route=route,
-                                                    still_valid=lambda: self._can_enter(candidate))
+                                                    still_valid=lambda: not trade["cancel_entry"] and self._can_enter(entry_candidate))
                     self._apply_entry_order(trade, order)
                     label = "Re-entry short" if reentry else "Short"
                     self._event(f"{label} limit submitted at ${trade['entry_limit']:g}", symbol=symbol)
@@ -789,8 +1056,29 @@ class LiveEngine:
                         raise OrderSubmissionUncertain("Cannot verify a flat book before entry route fallback")
                     trade["entry_terminal"] = False
                     self._event(f"Definitive unfilled rejection on {route}; trying the configured backup route", "warning", symbol)
+        except LocateDeferred as exc:
+            # This typed result proves no paid locate command was sent. Other
+            # failures, especially missing acknowledgments, never reach here.
+            reason = self._safe_error(eligibility.get("reason") or exc)
+            retry_at = self.now() + timedelta(seconds=LOCATE_RETRY_SECONDS)
+            retry = (not reentry and not trade.get("entry_token") and not trade["entry_filled_qty"]
+                     and not trade.get("reconciliation_required")
+                     and retry_at < stamp(trade["entry_deadline"]))
+            note = f"{reason}; no locate purchase or stock order sent. " + (
+                f"Retry after {retry_at:%H:%M:%S} ET when entry conditions recover" if retry else "No automatic retry available")
+            locate = {"status": "deferred" if retry else "not_purchased", "note": note,
+                      "requested": locate_started, "eligibility": dict(eligibility),
+                      "comparisons": list(getattr(self.broker, "locate_comparisons", {}).get(symbol, [])) if locate_started else []}
+            trade.setdefault("locate_deferrals", []).append({"time": self.now().isoformat(), **locate})
+            trade.update(status="locate_deferred" if retry else "skipped", note=note, locate=locate,
+                         locate_retry_after=retry_at.isoformat())
+            self._event(note, "warning", symbol)
         except Exception as exc:
             trade["note"] = self._safe_error(exc)
+            if locate_started and trade.get("locate", {}).get("status") not in {"available", "reused", "unavailable"}:
+                trade["locate"] = {"status": "failed", "note": trade["note"], "requested": True,
+                                   "eligibility": dict(eligibility),
+                                   "comparisons": list(getattr(self.broker, "locate_comparisons", {}).get(symbol, []))}
             self._broker_failed(exc)
             if trade.get("entry_token"):
                 trade.update(status="uncertain", reconciliation_required=True)
@@ -819,9 +1107,12 @@ class LiveEngine:
             trade.update(entry_filled_qty=filled, entry_avg_price=average,
                          stop_price=percent(average, trade["stop_percent"]), target_price=percent(average, -trade["target_percent"]))
             if order.get("last_fill_time") and stamp(order["last_fill_time"]) >= stamp(trade["entry_deadline"]):
+                if not trade.get("exit_reason"):
+                    self._record_exit_evidence(trade, "late_entry_fill")
                 trade.update(late_entry_fill=True, cancel_entry=True, exit_reason=trade.get("exit_reason") or "late_entry_fill")
         if trade["entry_terminal"] and not filled:
-            trade.update(status="skipped", note=f"Entry {order['status']} with no fills")
+            reason = f"; {trade['entry_cancel_reason']}" if trade.get("entry_cancel_reason") else ""
+            trade.update(status="skipped", note=f"Entry {order['status']} with no fills{reason}")
         elif filled:
             trade["status"] = "open"
         trade["remaining_qty"] = filled - sum(item.get("filled_qty", 0) for item in trade["cover_orders"])
@@ -835,6 +1126,7 @@ class LiveEngine:
         if trade.get("exit_reason"):
             return trade["exit_reason"]
         if self.now() >= stamp(trade["time_exit"]):
+            self._record_exit_evidence(trade, "time_exit")
             return "time_exit"
         quote = self._fresh_quote(trade["symbol"])
         if quote and trade["entry_filled_qty"]:
@@ -842,8 +1134,10 @@ class LiveEngine:
             if filled_at and stamp(quote["timestamp"]) < stamp(filled_at):
                 return ""  # A cached price before this entry cannot trigger its stop/target.
             if quote["ask"] >= trade["stop_price"]:
+                self._record_exit_evidence(trade, "stop_loss", quote)
                 return "stop_loss"
             if quote["ask"] <= trade["target_price"]:
+                self._record_exit_evidence(trade, "profit_target", quote)
                 return "profit_target"
         return ""
 
@@ -893,6 +1187,7 @@ class LiveEngine:
         if trade["status"] == "skipped":
             self._dirty = True
             return
+        self._cancel_entry_outside_price_range(trade, self._fresh_quote(trade["symbol"]))
         reason = self._exit_signal(trade) if remaining else trade.get("exit_reason", "")
         if reason:
             trade["exit_reason"] = reason
@@ -900,7 +1195,8 @@ class LiveEngine:
         if self.now() >= stamp(trade["entry_deadline"]) or not self.entries_enabled or not self._data_status.get("ready"):
             trade["cancel_entry"] = True
         if trade["cancel_entry"] and not trade["entry_terminal"]:
-            trade["note"] = "Canceling unfilled entry remainder; awaiting DAS confirmation"
+            prefix = f"{trade['entry_cancel_reason']}; " if trade.get("entry_cancel_reason") else ""
+            trade["note"] = prefix + "Canceling unfilled entry remainder; awaiting DAS confirmation"
             self._persist()
             await asyncio.to_thread(self.broker.cancel_order, trade["entry_order_id"])
             return
@@ -980,9 +1276,11 @@ class LiveEngine:
 
     def _manage_monitor_trade(self, trade: dict) -> None:
         quote = self._fresh_quote(trade["symbol"])
+        self._cancel_entry_outside_price_range(trade, quote)
         if not trade["entry_filled_qty"]:
             if self.now() >= stamp(trade["entry_deadline"]) or trade["cancel_entry"] or not self.entries_enabled:
-                trade.update(status="skipped", entry_terminal=True, note="Simulated entry canceled without a fill")
+                reason = f"; {trade['entry_cancel_reason']}" if trade.get("entry_cancel_reason") else ""
+                trade.update(status="skipped", entry_terminal=True, note=f"Simulated entry canceled without a fill{reason}")
             elif self._data_status.get("ready") and quote and quote["bid"] >= trade["entry_limit"]:
                 trade.update(entry_filled_qty=trade["requested_qty"], entry_avg_price=quote["bid"], entry_time=self.now().isoformat(),
                              entry_terminal=True, remaining_qty=trade["requested_qty"], status="open", note="Simulated full fill at SIP bid",
@@ -1021,6 +1319,7 @@ class LiveEngine:
     async def cover_all(self) -> None:
         self.entries_enabled = False
         for trade in self._trades(active=True):
+            self._record_exit_evidence(trade, "manual_cover")
             trade.update(cancel_entry=True, exit_reason="manual_cover")
         self._event("Manual cover requested for this strategy's managed positions", "warning")
         self._persist()
@@ -1037,6 +1336,8 @@ class LiveEngine:
             await self._entry_task
         if self.settings.execution_enabled and self._trades(active=True):
             for trade in self._trades(active=True):
+                if not trade.get("exit_reason"):
+                    self._record_exit_evidence(trade, "shutdown")
                 trade.update(cancel_entry=True, exit_reason=trade.get("exit_reason") or "shutdown")
             self._event("Shutdown requested: canceling entries and covering managed positions", "warning")
             self._persist()
@@ -1054,7 +1355,7 @@ class LiveEngine:
         # Let an in-flight supervisor broker call finish before releasing the
         # account lock. Canceling to_thread does not stop its socket worker.
         await asyncio.gather(*(task for task in self._tasks if task.get_name() == "4am-supervisor"), return_exceptions=True)
-        tasks = [*self._tasks, self._bootstrap_task, self._finalize_task, self._backtest_task]
+        tasks = [*self._tasks, self._bootstrap_task, self._finalize_task, self._late_finalize_task, self._backtest_task]
         for task in tasks:
             if task and not task.done():
                 task.cancel()
@@ -1095,6 +1396,13 @@ class LiveEngine:
                     row.update(pending)
                     if self.now() >= self._candidate_deadline(pending):
                         row.update(status="expired", note="Re-entry deadline passed")
+                    else:
+                        price_reason = self._entry_price_block_reason(row["entry_limit"], "Entry limit")
+                        quote = self._fresh_quote(row["symbol"])
+                        if price_reason:
+                            row.update(status="price_filtered", note=price_reason)
+                        elif quote and (price_reason := self._entry_price_block_reason(quote["bid"], "Bid")):
+                            row.update(status="waiting_for_price", note=price_reason)
                 else:
                     row.update(status=trade["status"], note=trade["note"], locate=trade["locate"],
                                trade_number=trade.get("trade_number", 1), entry_limit=trade["entry_limit"])

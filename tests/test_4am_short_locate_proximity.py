@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 from four_am_short.config import StrategyConfig
 from four_am_short.live.config import DasSettings, LiveSettings, load_live_settings
 from four_am_short.live.engine import LiveEngine
+from four_am_short.live.das import DasError, LocateDeferred
 from four_am_short.models import Bar, EASTERN
 from test_4am_short_live_engine import FakeBroker, FakeClock, FakeData, FakeFeed
 
@@ -48,7 +49,7 @@ class LocateTrackingBroker(FakeBroker):
             self.before_accept()
         self.validity_checks.append(still_valid is not None and still_valid())
         if not all(self.validity_checks[-2:]):
-            return False, "Entry conditions changed before paid acceptance", "", 0.0
+            raise LocateDeferred("Entry conditions changed before paid acceptance; no purchase sent")
         self.paid_acceptances += 1
         if self.after_accept:
             self.after_accept()
@@ -183,20 +184,153 @@ class LocateProximityTests(unittest.IsolatedAsyncioTestCase):
         await self.tick()
         self.assertFalse(self.broker.locates)
         self.assertFalse(self.broker.submissions)
-        self.assertEqual(self.engine._day_state()["trades"]["TEST"]["status"], "skipped")
-
-    async def test_price_fade_callback_blocks_paid_acceptance_and_is_not_retried(self):
+        self.assertEqual(self.engine._day_state()["trades"]["TEST"]["status"], "locate_deferred")
+        self.broker.account_hook = None
+        self.clock.advance(30)
         await self.quote(8.91)
+        await self.tick()
+        self.assertEqual(self.broker.paid_acceptances, 1)
+
+    async def test_price_fade_defers_unpaid_attempt_and_recovers_after_cooldown(self):
+        await self.quote(8.91)
+        self.broker.locate_comparisons["TEST"] = [{"route": "LOCATE4", "price": .02}]
         self.broker.before_accept = lambda: self.worker_quote(8.50)
         await self.tick()
         self.assertEqual(self.broker.validity_checks, [True, False])
         self.assertEqual(self.broker.paid_acceptances, 0)
         self.assertFalse(self.broker.submissions)
-        self.assertEqual(self.engine._day_state()["trades"]["TEST"]["status"], "skipped")
+        trade = self.engine._day_state()["trades"]["TEST"]
+        self.assertEqual(trade["status"], "locate_deferred")
+        self.assertEqual(trade["locate"]["status"], "deferred")
+        self.assertIn("Bid $8.5 below locate trigger $8.91", trade["note"])
+        self.assertEqual(trade["locate"]["eligibility"]["bid"], 8.50)
+        self.assertEqual(trade["locate"]["eligibility"]["quote_age_seconds"], 0)
+        self.assertEqual(trade["locate"]["comparisons"], self.broker.locate_comparisons["TEST"])
+        self.assertFalse(self.engine._trades(active=True))
+        persisted = json.loads(self.engine.settings.state_path.read_text())["days"][str(self.engine._day)]["trades"]["TEST"]
+        self.assertEqual(persisted["locate"], trade["locate"])
         self.broker.before_accept = None
         await self.quote(8.91)
         await self.tick()
         await self.engine._enter(self.candidate)
+        self.assertEqual(len(self.broker.locates), 1)
+        self.assertFalse(self.broker.submissions)
+        self.clock.advance(29)
+        await self.quote(8.91)
+        await self.engine._enter(self.candidate)
+        self.assertEqual(len(self.broker.locates), 1)
+        self.clock.advance(1)
+        await self.quote(8.91)
+        await self.tick()
+        self.assertEqual(len(self.broker.locates), 2)
+        self.assertEqual(self.broker.paid_acceptances, 1)
+        self.assertEqual(len(self.broker.submissions), 1)
+        self.assertEqual(len(self.engine._day_state()["trades"]["TEST"]["locate_deferrals"]), 1)
+
+    async def test_stale_quote_during_locate_records_age_then_waits_for_fresh_bid(self):
+        await self.quote(8.91)
+        self.broker.before_accept = lambda: self.clock.advance(6)
+        await self.tick()
+        trade = self.engine._day_state()["trades"]["TEST"]
+        self.assertEqual(trade["status"], "locate_deferred")
+        self.assertIn("SIP quote is 6.00s old; maximum 5s", trade["note"])
+        self.assertEqual(trade["locate"]["eligibility"]["quote_age_seconds"], 6)
+        self.broker.before_accept = None
+        self.clock.advance(30)
+        await self.tick()
+        self.assertEqual(len(self.broker.locates), 1)
+        await self.quote(8.50)
+        await self.tick()
+        self.assertEqual(len(self.broker.locates), 1)
+        await self.quote(8.91)
+        await self.tick()
+        self.assertEqual(self.broker.paid_acceptances, 1)
+
+    async def test_deferred_attempt_respects_pause_readiness_and_original_deadline(self):
+        await self.quote(8.91)
+        self.broker.before_accept = lambda: self.worker_quote(8.50)
+        await self.tick()
+        trade = self.engine._day_state()["trades"]["TEST"]
+        self.broker.before_accept = None
+        self.clock.advance(30)
+        await self.quote(8.91)
+        self.engine.entries_enabled = False
+        await self.tick()
+        self.assertEqual(len(self.broker.locates), 1)
+        self.engine.entries_enabled = True
+        self.engine._data_status["ready"] = False
+        await self.tick()
+        self.assertEqual(len(self.broker.locates), 1)
+        self.engine._data_status["ready"] = True
+        self.clock.value = datetime.fromisoformat(trade["entry_deadline"])
+        self.engine.settings = replace(self.engine.settings, strategy=replace(self.engine.settings.strategy, entry_deadline="08:00"))
+        await self.quote(8.91)
+        await self.engine._enter(self.candidate)
+        await self.tick()
+        self.assertEqual(len(self.broker.locates), 1)
+        self.assertEqual(trade["status"], "skipped")
+        self.assertIn("Entry deadline passed", trade["note"])
+
+    async def test_generic_locate_failure_is_not_retryable_and_displays_requested(self):
+        await self.quote(8.91)
+        self.broker.ensure_shortable = Mock(side_effect=DasError("Purchase acknowledgment missing"))
+        await self.tick()
+        trade = self.engine._day_state()["trades"]["TEST"]
+        self.assertEqual(trade["status"], "skipped")
+        self.assertEqual(trade["locate"]["status"], "failed")
+        self.assertTrue(trade["locate"]["requested"])
+        self.clock.advance(30)
+        self.engine._broker_status["connected"] = True
+        await self.quote(8.91)
+        await self.engine._enter(self.candidate)
+        self.assertEqual(self.broker.ensure_shortable.call_count, 1)
+        self.assertFalse(self.broker.submissions)
+
+    async def test_restart_preserves_deferral_but_does_not_enable_entries(self):
+        await self.quote(8.91)
+        self.broker.before_accept = lambda: self.worker_quote(8.50)
+        await self.tick()
+        settings = self.engine.settings
+        self.engine.store.close()
+        self.engine = LiveEngine(settings, broker=self.broker, data=FakeData(), feed=FakeFeed(), now=self.clock)
+        await self.engine.open()
+        self.candidate = self.engine._day_state()["candidates"]["TEST"]
+        self.assertFalse(self.engine.running)
+        self.assertFalse(self.engine.entries_enabled)
+        self.assertFalse(self.engine._trades(active=True))
+        self.assertEqual(self.engine._day_state()["trades"]["TEST"]["status"], "locate_deferred")
+        self.clock.advance(30)
+        self.broker.before_accept = None
+        await self.quote(8.91)
+        await self.engine._enter(self.candidate)
+        self.assertEqual(len(self.broker.locates), 1)
+        await self.engine.start()
+        # Supply the finalized offline snapshot after the explicit Start.
+        if self.engine._bootstrap_task:
+            await self.engine._bootstrap_task
+        self.engine._window_finalized = True
+        self.engine._data_status.update(ready=True, backfill_ready=True)
+        await self.quote(8.91)
+        await self.engine._enter(self.candidate)
+        self.assertEqual(self.broker.paid_acceptances, 1)
+        self.assertEqual(len(self.broker.submissions), 1)
+
+    async def test_restart_expires_prior_day_deferral_without_broker_calls(self):
+        await self.quote(8.91)
+        self.broker.before_accept = lambda: self.worker_quote(8.50)
+        await self.tick()
+        old_day = str(self.engine._day)
+        settings = self.engine.settings
+        self.engine.store.close()
+        self.clock.advance(24 * 60 * 60)
+        self.engine = LiveEngine(settings, broker=self.broker, data=FakeData(), feed=FakeFeed(), now=self.clock)
+        await self.engine.open()
+        saved_trade = self.engine.state["days"][old_day]["trades"]["TEST"]
+        self.assertEqual(saved_trade["status"], "skipped")
+        self.assertIn("Entry deadline passed", saved_trade["note"])
+        self.assertEqual(saved_trade["locate"]["status"], "not_purchased")
+        self.assertNotIn("Retry after", saved_trade["locate"]["note"])
+        self.assertFalse(self.engine.running)
         self.assertEqual(len(self.broker.locates), 1)
         self.assertFalse(self.broker.submissions)
 
