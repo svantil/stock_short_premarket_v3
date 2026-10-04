@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit stopped-out first trades and their later highs using offline Massive bars.
+"""Audit stopped-out first trades and later highs using the configured provider's offline bars.
 
 The source report must match the supplied configuration and current input hash.
 No credentials are read and no network requests or trading operations are made.
@@ -19,7 +19,8 @@ from pathlib import Path
 from urllib.parse import quote
 
 from four_am_short.config import load_config
-from four_am_short.massive import API_BASE, MassiveClient
+from four_am_short.data_sources import create_client, provider_label
+from four_am_short.massive import API_BASE
 from four_am_short.models import EASTERN, DataError, PreviousClose
 from four_am_short.strategy import simulate
 
@@ -60,7 +61,11 @@ def offset(price: float, high: float) -> float:
     return (price / high - 1) * 100
 
 
-def cache_path(config, symbol: str, day: date) -> Path:
+def cache_path(config, symbol: str, day: date, *, client=None) -> Path:
+    if config.data.provider == "alpaca":
+        if client is None:
+            client = create_client(config.data, offline=True)
+        return client.minute_cache_path(symbol, day)
     identity = {
         "base_url": API_BASE,
         "path": f"/v2/aggs/ticker/{quote(symbol, safe='')}/range/1/minute/{day}/{day}",
@@ -70,12 +75,12 @@ def cache_path(config, symbol: str, day: date) -> Path:
     return config.data.cache_dir / "massive-v1" / f"{digest}.json"
 
 
-def inspect_stop(source: dict, config, client: MassiveClient, cutoffs: list[str]) -> dict:
+def inspect_stop(source: dict, config, client, cutoffs: list[str]) -> dict:
     day = date.fromisoformat(source["date"])
     high = float(source["early_high"])
     stopped = datetime.fromisoformat(source["exit_time"]).astimezone(EASTERN)
     activation = stopped + timedelta(minutes=1)
-    cached = cache_path(config, source["symbol"], day)
+    cached = cache_path(config, source["symbol"], day, client=client)
     row = {
         "date": source["date"], "symbol": source["symbol"],
         "early_high": high, "early_high_bar_time": source["early_high_bar_time"],
@@ -255,7 +260,9 @@ def main() -> int:
     source_summary_file = report / "4am_short_summary.json"
     source_trades_file = report / "4am_short_trades.csv"
     source_summary = json.loads(source_summary_file.read_text())
-    source_config = json.loads(config_file.read_text())
+    # Resolved snapshots contain absolute paths. Re-load them to apply defaults
+    # added since older reports were generated, including the Massive provider.
+    source_config = load_config(config_file).snapshot()
     current_snapshot = config.snapshot()
     if source_config != current_snapshot:
         raise DataError("Source report resolved config must exactly match current config")
@@ -271,7 +278,7 @@ def main() -> int:
         stops = [row for row in csv.DictReader(handle) if row["status"] == "trade" and int(row.get("trade_number") or 1) == 1 and row["exit_reason"] == "stop_loss"]
     if len({(row["date"], row["symbol"]) for row in stops}) != len(stops):
         raise DataError("Source report contains duplicate initial stop-outs")
-    client = MassiveClient(config.data, api_key=None, offline=True)
+    client = create_client(config.data, offline=True)
     rows = [inspect_stop(row, config, client, args.cutoffs) for row in stops]
     offsets = [2.5 * index for index in range(13)]
     bands = {
@@ -291,7 +298,8 @@ def main() -> int:
             "source_initial_trades": source_summary["statistics"]["initial_trades"],
             "source_errors": source_summary["statistics"]["errors"],
             "source_incomplete": source_summary["statistics"]["incomplete"],
-            "bar_source": "Validated Massive offline cache, unadjusted one-minute trade aggregates",
+            "data_provider": config.data.provider,
+            "bar_source": f"Validated {provider_label(config.data)} offline cache, unadjusted one-minute trade aggregates",
             "configuration_snapshot": current_snapshot,
         },
         "method": {

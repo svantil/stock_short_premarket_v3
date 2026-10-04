@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import tempfile
 from pathlib import Path
+
+
+class StateLockError(RuntimeError):
+    """Another supervisor still holds the OS lock for this state."""
 
 
 class StateStore:
@@ -14,7 +19,8 @@ class StateStore:
 
     def open(self) -> dict:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        handle = self.path.with_suffix(".lock").open("a+b")
+        lock_path = self.path.with_suffix(".lock")
+        handle = lock_path.open("a+b")
         try:
             if os.name == "nt":
                 import msvcrt
@@ -25,10 +31,38 @@ class StateStore:
             else:
                 import fcntl
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        except OSError as exc:
+            owner_pid = None
+            if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                try:
+                    handle.seek(0)
+                    owner = json.loads(handle.read(4096))
+                    if isinstance(owner, dict) and type(owner.get("pid")) is int and owner["pid"] > 0:
+                        owner_pid = owner["pid"]
+                except (OSError, ValueError):
+                    pass
             handle.close()
-            raise RuntimeError("Another 4am short process owns this live state") from None
+            if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                raise
+            owner_hint = f" Last recorded owner: PID {owner_pid}." if owner_pid else ""
+            raise StateLockError(
+                "Another 4am short process owns this live state."
+                f"{owner_hint} Lock: {lock_path}. "
+                "Use the existing dashboard or inspect the owning process before restarting. "
+                "A suspended process (Ctrl-Z) still holds this lock and cannot supervise exits. "
+                "Do not delete the lock file or change state directories to bypass it."
+            ) from None
         self._lock = handle
+        try:
+            # Diagnostics only: stale metadata never substitutes for the OS lock.
+            # The record also supplies a byte for subsequent Windows locking.
+            handle.seek(0)
+            handle.truncate()
+            handle.write(json.dumps({"pid": os.getpid()}).encode("utf-8"))
+            handle.flush()
+        except BaseException:
+            self.close()
+            raise
         try:
             if not self.path.exists():
                 return {"version": 1, "identity": self.identity, "days": {}, "events": []}

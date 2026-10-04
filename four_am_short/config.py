@@ -71,6 +71,9 @@ class DataConfig:
     request_delay_seconds: float = 0.25
     previous_close_lookback_days: int = 14
     calendar_symbol: str = "SPY"
+    provider: str = "massive"
+    alpaca_api_key_env: str = "ALPACA_API_KEY"
+    alpaca_secret_key_env: str = "ALPACA_SECRET_KEY"
 
 
 @dataclass(frozen=True)
@@ -212,8 +215,11 @@ def load_config(path: Path) -> BacktestConfig:
         data[name] = number(data[name], name, strict=name == "timeout_seconds")
     integer(data["max_retries"], "max_retries", 0)
     integer(data["previous_close_lookback_days"], "previous_close_lookback_days", 1)
-    if not isinstance(data["api_key_env"], str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", data["api_key_env"]):
-        raise DataError("api_key_env must be an environment variable name")
+    if not isinstance(data["provider"], str) or data["provider"] not in {"massive", "alpaca"}:
+        raise DataError("data.provider must be massive or alpaca")
+    for name in ("api_key_env", "alpaca_api_key_env", "alpaca_secret_key_env"):
+        if not isinstance(data[name], str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", data[name]):
+            raise DataError(f"{name} must be an environment variable name")
     data["calendar_symbol"] = symbol(data["calendar_symbol"])
     data["cache_dir"] = _path(str(data["cache_dir"]) if isinstance(data["cache_dir"], Path) else data["cache_dir"], path.parent, "cache_dir")
     if data["env_file"] is not None:
@@ -241,18 +247,35 @@ def symbol(value: object) -> str:
 
 def read_api_key(config: DataConfig) -> str | None:
     """Read only the requested credential, without importing other .env settings."""
-    key = os.environ.get(config.api_key_env, "").strip()
-    if key:
-        return key
+    return _read_credential(config, (config.api_key_env,))
+
+
+def read_alpaca_credentials(config: DataConfig) -> tuple[str | None, str | None]:
+    """Use the live feed's credential names/aliases; never load broker settings."""
+    key_names = (config.alpaca_api_key_env,)
+    secret_names = (config.alpaca_secret_key_env,)
+    if config.alpaca_api_key_env == "ALPACA_API_KEY":
+        key_names += ("APCA_API_KEY_ID",)
+    if config.alpaca_secret_key_env == "ALPACA_SECRET_KEY":
+        secret_names += ("APCA_API_SECRET_KEY",)
+    return _read_credential(config, key_names), _read_credential(config, secret_names)
+
+
+def _read_credential(config: DataConfig, names: tuple[str, ...]) -> str | None:
+    for name in names:
+        key = os.environ.get(name, "").strip()
+        if key:
+            return key
     if config.env_file is None or not config.env_file.exists():
         return None
     try:
+        values = {}
         for line in config.env_file.read_text(encoding="utf-8-sig").splitlines():
             text = line.strip()
             if text.startswith("export "):
                 text = text[7:].lstrip()
             name, separator, value = text.partition("=")
-            if separator and name.strip() == config.api_key_env:
+            if separator and name.strip() in names:
                 value = value.strip()
                 if value.startswith(("'", '"')):
                     quote = value[0]
@@ -262,7 +285,8 @@ def read_api_key(config: DataConfig) -> str | None:
                     value = value[1:end]
                 else:
                     value = value.split(" #", 1)[0].strip()
-                return value or None
+                values.setdefault(name.strip(), value)
+        return next((values[name] for name in names if values.get(name)), None)
     except OSError as exc:
         raise DataError(f"Cannot read credential file {config.env_file}") from exc
     return None

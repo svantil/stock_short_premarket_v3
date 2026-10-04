@@ -5,7 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from four_am_short.config import load_config, read_api_key
+from four_am_short.config import load_config, read_alpaca_credentials, read_api_key
 from four_am_short.inputs import read_candidates
 from four_am_short.models import DataError, TradeResult
 from four_am_short.reports import summarize, write_reports
@@ -31,6 +31,7 @@ class ConfigAndReportTests(unittest.TestCase):
         self.assertEqual(config.strategy.late_gap_window_minutes, 15)
         self.assertEqual(config.strategy_name, "4am short")
         self.assertEqual(config.strategy_id, "4am_short")
+        self.assertEqual(config.data.provider, "massive")
         self.assertEqual(config.output_dir, self.root / "outcome" / "4am_short")
         self.assertEqual(config.input_file, self.root / "stocks.csv")
         self.assertEqual([(str(c.trading_date), c.symbol) for c in read_candidates(config)], [("2026-01-02", "XYZ"), ("2026-01-05", "AAA"), ("2026-01-05", "BBB"), ("2026-01-05", "CCC")])
@@ -46,6 +47,8 @@ class ConfigAndReportTests(unittest.TestCase):
             {"strategy": {"late_gap_window_minutes": 0}}, {"strategy": {"late_gap_window_minutes": True}},
             {"strategy": {"late_gap_window_minutes": 15.5}},
             {"data": {"max_retries": -1}}, {"symbols": "AAA"}, {"from_date": "20260101"},
+            {"data": {"provider": "iex"}}, {"data": {"provider": []}},
+            {"data": {"alpaca_secret_key_env": "secret key"}},
         ]
         for value in invalid:
             with self.subTest(value=value):
@@ -93,6 +96,34 @@ class ConfigAndReportTests(unittest.TestCase):
         self.assertEqual(len((directory / "4am_short_trades.csv").read_text().splitlines()), 3)
         self.assertEqual(len((directory / "4am_short_candidates.csv").read_text().splitlines()), 4)
         self.assertTrue((directory / "4am_short_config.resolved.json").exists())
+
+    def test_alpaca_credentials_aliases_environment_precedence_and_report_provenance(self):
+        self.raw["data"] = {"provider": "alpaca"}
+        config = self.config()
+        config.data.env_file.write_text(
+            "ALPACA_API_KEY='file-key'\nALPACA_SECRET_KEY=\"file-secret\"\n"
+            "DAS_PASSWORD='unrelated unclosed quote\n")
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(read_alpaca_credentials(config.data), ("file-key", "file-secret"))
+        with patch.dict("os.environ", {"APCA_API_KEY_ID": "env-key", "APCA_API_SECRET_KEY": "env-secret"}, clear=True):
+            self.assertEqual(read_alpaca_credentials(config.data), ("env-key", "env-secret"))
+        folder, report = write_reports(config, [], requested_count=0)
+        self.assertEqual(report["data_provider"], "alpaca")
+        self.assertEqual(report["data_feed"], "sip")
+        self.assertIn("Alpaca SIP", report["assumptions"]["price_data"])
+        self.assertIn("Data source: Alpaca SIP", (folder / "4am_short_trade_details.txt").read_text())
+        self.assertNotIn("file-secret", json.dumps(config.snapshot()))
+        self.assertNotIn("file-key", json.dumps(config.snapshot()))
+
+    def test_custom_alpaca_credential_names_do_not_use_default_aliases(self):
+        self.raw["data"] = {"provider": "alpaca", "alpaca_api_key_env": "CUSTOM_KEY",
+                            "alpaca_secret_key_env": "CUSTOM_SECRET"}
+        config = self.config()
+        with patch.dict("os.environ", {"APCA_API_KEY_ID": "alias", "APCA_API_SECRET_KEY": "alias"}, clear=True):
+            self.assertEqual(read_alpaca_credentials(config.data), (None, None))
+        config.data.env_file.write_text("CUSTOM_KEY=custom-key\nCUSTOM_SECRET=custom-secret\n")
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(read_alpaca_credentials(config.data), ("custom-key", "custom-secret"))
 
     def test_simultaneous_exits_do_not_invent_symbol_order_for_drawdown(self):
         rows = [

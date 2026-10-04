@@ -1,11 +1,17 @@
 """Checks for the offline post-stop excursion diagnostic."""
 
+import contextlib
+import hashlib
+import io
+import json
 import tempfile
 import unittest
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date
 from pathlib import Path
+from unittest.mock import Mock, patch
 
+import analyze_4am_short_excursions as runner
 from analyze_4am_short_excursions import at, describe, inspect_stop, summarize
 from four_am_short.config import BacktestConfig, DataConfig, StrategyConfig
 from four_am_short.models import Bar, DataError, PreviousClose
@@ -35,7 +41,7 @@ class ExcursionAnalysisTests(unittest.TestCase):
         self.config = BacktestConfig(
             Path(self.temp.name) / "input.csv", Path(self.temp.name),
             StrategyConfig(entry_deadline="09:00"),
-            DataConfig(cache_dir=Path(self.temp.name)),
+            DataConfig(cache_dir=Path(self.temp.name), env_file=None),
         )
         self.bars = [
             self.bar("04:00", 9.5, 10, 9, 9.5),
@@ -98,6 +104,63 @@ class ExcursionAnalysisTests(unittest.TestCase):
         self.assertEqual(stats["p25"], 17.5)
         self.assertEqual(stats["mean_excluding_single_largest"], 20)
         self.assertEqual(describe([]), {"count": 0})
+
+    def test_alpaca_replay_records_selected_clients_cache_path_and_hash(self):
+        config = replace(self.config, data=replace(self.config.data, provider="alpaca"))
+        cached = Path(self.temp.name) / "alpaca-minute-cache.json"
+        cached.write_text('{"source": "alpaca"}')
+        client = BarsClient(self.bars)
+        client.minute_cache_path = Mock(return_value=cached)
+        row = inspect_stop(self.source(self.bars), config, client, ["09:00"])
+        client.minute_cache_path.assert_called_once_with("TEST", self.day)
+        self.assertEqual(row["analysis_status"], "ok")
+        self.assertEqual(row["cache_path"], str(cached))
+        self.assertEqual(row["cache_sha256"], hashlib.sha256(cached.read_bytes()).hexdigest())
+
+    def test_main_uses_offline_provider_and_accepts_legacy_massive_snapshot(self):
+        folder = Path(self.temp.name)
+        self.config.input_file.write_text("2026-01-02,TEST\n")
+        for provider in ("massive", "alpaca"):
+            with self.subTest(provider=provider):
+                config = replace(self.config, data=replace(self.config.data, provider=provider))
+                config_path = folder / f"{provider}.json"
+                snapshot = config.snapshot()
+                config_path.write_text(json.dumps(snapshot))
+                report = folder / provider
+                report.mkdir()
+                source_snapshot = config.snapshot()
+                if provider == "massive":
+                    source_snapshot["data"].pop("provider")
+                    for field in list(source_snapshot["data"]):
+                        if field.startswith("alpaca_"):
+                            source_snapshot["data"].pop(field)
+                (report / "4am_short_config.resolved.json").write_text(json.dumps(source_snapshot))
+                (report / "4am_short_summary.json").write_text(json.dumps({
+                    "input_sha256": hashlib.sha256(config.input_file.read_bytes()).hexdigest(),
+                    "statistics": {"initial_trades": 0, "errors": 0, "incomplete": 0},
+                }))
+                (report / "4am_short_trades.csv").write_text("status,trade_number,exit_reason\n")
+                output = folder / f"{provider}-audit"
+                with patch("sys.argv", ["analyze", "--config", str(config_path),
+                                        "--source-report", str(report), "--output-dir", str(output)]), \
+                        patch.object(runner, "create_client") as factory, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(runner.main(), 0)
+                factory.assert_called_once_with(runner.load_config(config_path).data, offline=True)
+                provenance = json.loads((output / "excursion_summary.json").read_text())["provenance"]
+                self.assertEqual(provenance["data_provider"], provider)
+                self.assertIn(provider.title(), provenance["bar_source"])
+                if provider == "alpaca":
+                    self.assertIn("Alpaca SIP", provenance["bar_source"])
+
+                source_snapshot["data"]["provider"] = "massive" if provider == "alpaca" else "alpaca"
+                (report / "4am_short_config.resolved.json").write_text(json.dumps(source_snapshot))
+                with patch("sys.argv", ["analyze", "--config", str(config_path),
+                                        "--source-report", str(report), "--output-dir", str(output)]), \
+                        patch.object(runner, "create_client") as factory, \
+                        self.assertRaisesRegex(DataError, "Source report resolved config"):
+                    runner.main()
+                factory.assert_not_called()
 
 
 if __name__ == "__main__":

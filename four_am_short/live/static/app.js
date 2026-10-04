@@ -174,9 +174,12 @@
     text("skippedCount", `${num(counts.skipped ?? 0)} skipped`);
     text("openCount", num(counts.open ?? 0));
     text("closedCount", `${num(counts.closed ?? 0)} closed`);
-    const realized = (state.trades || []).reduce((total, trade) => total + (Number(trade.realized_pnl) || 0), 0);
+    const trades = state.trades || [];
+    const missingPnl = trades.filter((trade) => trade.status === "closed" && !numeric(trade.realized_pnl)).length;
+    const realized = trades.reduce((total, trade) => total + (Number(trade.realized_pnl) || 0), 0);
+    const pnlCaveat = missingPnl ? `Known subtotal · ${num(missingPnl)} closed ${missingPnl === 1 ? "trade" : "trades"} missing P/L · ` : "";
     text("realizedPnl", money(realized));
-    text("pnlBasis", `${state.demo ? "Fictional" : monitor ? "Simulated" : "DAS"} fills · before commissions and locates`);
+    text("pnlBasis", `${pnlCaveat}${state.demo ? "Fictional" : monitor ? "Simulated" : "DAS"} fills · before commissions and locates`);
     text("fillBasis", state.demo ? "Fictional preview fills" : monitor ? "Simulated entries at bid and exits at ask" : "Entry and exit prices reflect confirmed DAS fills");
     $("realizedPnl").className = signClass(realized);
     const warning = $("connectionWarning");
@@ -215,7 +218,7 @@
     text("tradeBadge", num(trades.length));
     $("tradeRows").innerHTML = trades.length ? trades.map((row) => {
       const hasExitFill = numeric(row.exit_avg_price) && Number(row.exit_avg_price) > 0;
-      const target = hasExitFill ? row.exit_reason === "profit_target" ? "YES" : "NO" : "Pending";
+      const target = hasExitFill ? row.exit_reason === "profit_target" ? "YES" : "NO" : row.status === "closed" ? "Unknown" : "Pending";
       const leg = Number(row.trade_number ?? 1) === 2 ? "Re-entry" : "Initial";
       return `<tr><td><strong class="stock-symbol">${esc(row.symbol)}</strong><small>${esc(leg)} · ${tag(row.status)}</small></td><td>${pair(`${num(row.entry_filled_qty ?? 0)} / ${num(row.requested_qty)}`, `${num(row.remaining_qty ?? 0)} open`)}</td><td>${pair(price(row.entry_avg_price), time(row.entry_time))}</td><td>${pair(`Stop ${price(row.stop_price)}`, `Target ${price(row.target_price)}`)}</td><td>${pair(price(row.exit_avg_price), time(row.exit_time))}</td><td>${pair(readable(row.exit_reason), `Target hit: ${target}`)}</td><td class="${signClass(row.realized_pnl)}">${esc(money(row.realized_pnl))}</td><td>${locateCell(row.locate, null, `trade:${row.symbol}:${leg}`)}<small class="cell-note">${esc(row.note || "")}</small></td></tr>`;
     }).join("") : empty(8, "No orders or positions for this session.");

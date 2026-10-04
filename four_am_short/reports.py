@@ -266,6 +266,7 @@ def write_reports(config: BacktestConfig, rows: list[TradeResult], *, requested_
     write_csv(report_path("trades.csv"), [row for row in all_rows if row["status"] == "trade"], columns)
     details_header = (
         f"{STRATEGY_NAME} backtest - all times Eastern (America/New_York)\n"
+        f"Data source: {'Alpaca SIP' if config.data.provider == 'alpaca' else 'Massive'}\n"
         "Times identify one-minute bars, not exact trade ticks. The setup-high wait reference is shown separately.\n\n"
     )
     candidate_indices = {key: index for index, key in enumerate(
@@ -291,6 +292,8 @@ def write_reports(config: BacktestConfig, rows: list[TradeResult], *, requested_
     summary = {
         "strategy_id": STRATEGY_ID, "strategy_name": STRATEGY_NAME,
         "version": __version__, "timezone": "America/New_York",
+        "data_provider": config.data.provider,
+        "data_feed": "sip" if config.data.provider == "alpaca" else "Massive aggregates",
         "created_at": datetime.now(EASTERN).isoformat(),
         "requested_candidates": requested_count, "processed_candidates": len(candidate_indices),
         "unprocessed_candidates": requested_count - len(candidate_indices), "interrupted": interrupted,
@@ -301,7 +304,11 @@ def write_reports(config: BacktestConfig, rows: list[TradeResult], *, requested_
         "gap_not_traded_reasons": gap_not_traded_reasons(rows),
         "status_reasons": dict(sorted(Counter(row.reason or row.exit_reason for row in rows).items())),
         "assumptions": {
-            "price_data": "Unadjusted Massive one-minute aggregates; prior regular close normalized for trade-date splits.",
+            "price_data": (
+                "Raw Alpaca SIP one-minute bars; exact previous-session regular close normalized to the trade date's share basis using matched raw/split-adjusted bars. Later splits cancel from the adjustment ratios."
+                if config.data.provider == "alpaca" else
+                "Unadjusted Massive one-minute aggregates; prior regular close normalized for trade-date splits."
+            ),
             "time_precision": "Intrabar fills carry the bar-start timestamp, not an observed execution timestamp.",
             "high_time_reference": config.strategy.high_time_reference,
             "repeated_high_policy": config.strategy.repeated_high_policy,

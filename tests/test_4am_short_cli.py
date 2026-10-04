@@ -40,13 +40,60 @@ class CLITests(unittest.TestCase):
         return [bar("04:00", 13.1, 14, 13.1, 13.5), bar("04:15", 13, 13.1, 11, 11.2)]
 
     def test_validate_does_not_require_credentials_or_network(self):
-        with patch("four_am_short.cli.MassiveClient") as provider:
+        with patch("four_am_short.data_sources.MassiveClient") as provider:
             self.assertEqual(self.run_cli("--validate-only"), 0)
             provider.assert_not_called()
         self.assertFalse((self.root / "outcome").exists())
 
+    def test_alpaca_validation_needs_no_credentials_or_client(self):
+        with patch("four_am_short.cli.create_client") as factory:
+            self.assertEqual(self.run_cli("--data-provider", "alpaca", "--validate-only"), 0)
+            factory.assert_not_called()
+        self.assertIn("Data: Alpaca SIP", self.output.getvalue())
+
+    def test_alpaca_override_routes_data_and_records_effective_provider(self):
+        original_config = self.config.read_bytes()
+        with patch("four_am_short.data_sources.AlpacaClient") as alpaca, patch("four_am_short.data_sources.MassiveClient") as massive:
+            alpaca.return_value.previous_close.return_value = PreviousClose(date(2026, 1, 2), 10)
+            alpaca.return_value.minute_bars.return_value = self.bars()
+            self.assertEqual(self.run_cli("--data-provider", "alpaca", "--offline"), 0)
+            massive.assert_not_called()
+            self.assertEqual(alpaca.call_args.args[0].provider, "alpaca")
+            self.assertEqual(alpaca.call_args.args[1:], (None, None))
+            self.assertTrue(alpaca.call_args.kwargs["offline"])
+        self.assertEqual(self.config.read_bytes(), original_config)
+        folder, summary = self.summary()
+        self.assertEqual(summary["statistics"]["trades"], 2)
+        self.assertEqual(summary["data_provider"], "alpaca")
+        saved = json.loads((folder / "4am_short_config.resolved.json").read_text())
+        self.assertEqual(saved["data"]["provider"], "alpaca")
+
+    def test_json_selects_alpaca_and_cli_can_override_back_to_massive(self):
+        self.config.write_text(json.dumps({"input_file": "stocks.txt", "data": {"provider": "alpaca"}}))
+        with patch("four_am_short.data_sources.MassiveClient") as massive, patch("four_am_short.data_sources.AlpacaClient") as alpaca:
+            massive.return_value.previous_close.return_value = PreviousClose(date(2026, 1, 2), 10)
+            massive.return_value.minute_bars.return_value = self.bars()
+            self.assertEqual(self.run_cli("--data-provider", "massive", "--offline"), 0)
+            alpaca.assert_not_called()
+        self.assertEqual(self.summary()[1]["data_provider"], "massive")
+
+    def test_missing_alpaca_credentials_fails_before_provider_construction(self):
+        with patch.dict("os.environ", {}, clear=True), patch("four_am_short.data_sources.AlpacaClient") as alpaca, patch("four_am_short.data_sources.MassiveClient") as massive:
+            self.assertEqual(self.run_cli("--data-provider", "alpaca"), 2)
+            alpaca.assert_not_called()
+            massive.assert_not_called()
+        self.assertIn("ALPACA_API_KEY and ALPACA_SECRET_KEY", self.output.getvalue())
+
+    def test_alpaca_errors_do_not_fall_back_to_massive(self):
+        self.config.write_text(json.dumps({"input_file": "stocks.txt", "data": {"provider": "alpaca"}}))
+        with patch("four_am_short.data_sources.AlpacaClient") as alpaca, patch("four_am_short.data_sources.MassiveClient") as massive:
+            alpaca.return_value.previous_close.side_effect = DataError("Alpaca SIP access denied")
+            self.assertEqual(self.run_cli("--offline"), 3)
+            massive.assert_not_called()
+        self.assertEqual(self.summary()[1]["statistics"]["errors"], 2)
+
     def test_end_to_end_fills_reports_and_preserves_original_input(self):
-        with patch("four_am_short.cli.MassiveClient") as provider:
+        with patch("four_am_short.data_sources.MassiveClient") as provider:
             provider.return_value.previous_close.return_value = PreviousClose(date(2026, 1, 2), 10)
             def fetch(*args):
                 self.input.write_text("2026-01-06 NEW\n")  # Concurrent scanner update.
@@ -111,7 +158,7 @@ class CLITests(unittest.TestCase):
         self.assertIn("Gap-to-trade summary - 4am short", (folder / "4am_short_gap_summary.txt").read_text())
 
     def test_candidate_data_error_persists_report_and_nonzero_exit(self):
-        with patch("four_am_short.cli.MassiveClient") as provider:
+        with patch("four_am_short.data_sources.MassiveClient") as provider:
             provider.return_value.previous_close.side_effect = DataError("missing prior close")
             self.assertEqual(self.run_cli("--offline"), 3)
         self.assertEqual(self.summary()[1]["statistics"]["errors"], 2)
@@ -145,7 +192,7 @@ class CLITests(unittest.TestCase):
         ]
         with patch("four_am_short.cli.datetime", Clock), \
              patch("four_am_short.massive.datetime", Clock), \
-             patch("four_am_short.cli.read_api_key", return_value="fixture-secret"), \
+             patch("four_am_short.data_sources.read_api_key", return_value="fixture-secret"), \
              patch("four_am_short.massive.build_opener") as opener:
             request = opener.return_value.open
             request.side_effect = [io.BytesIO(json.dumps(payload).encode()) for payload in payloads]
@@ -184,7 +231,7 @@ class CLITests(unittest.TestCase):
             Bar(datetime.fromisoformat(f"2026-01-05T{clock}:00").replace(tzinfo=EASTERN), price, price, price, price)
             for clock, price in (("04:00", 20), ("04:15", 18), ("04:16", 24), ("04:17", 24), ("04:18", 14))
         ]
-        with patch("four_am_short.cli.MassiveClient") as provider:
+        with patch("four_am_short.data_sources.MassiveClient") as provider:
             provider.return_value.previous_close.return_value = PreviousClose(date(2026, 1, 2), 10)
             provider.return_value.minute_bars.return_value = history
             self.assertEqual(self.run_cli("--offline"), 0)
@@ -225,7 +272,7 @@ class CLITests(unittest.TestCase):
             "input_file": "stocks.txt", "shares": 1000,
             "strategy": {"reentry": {"enabled": True}},
         }))
-        with patch("four_am_short.cli.MassiveClient") as provider:
+        with patch("four_am_short.data_sources.MassiveClient") as provider:
             provider.return_value.previous_close.return_value = PreviousClose(date(2026, 1, 2), 10)
             provider.return_value.minute_bars.return_value = self.bars()
             self.assertEqual(self.run_cli("--offline"), 0)
@@ -245,7 +292,7 @@ class CLITests(unittest.TestCase):
         self.config.write_text(json.dumps({
             "input_file": "stocks.txt", "strategy": {"reentry": {"enabled": True}},
         }))
-        with patch("four_am_short.cli.MassiveClient") as provider:
+        with patch("four_am_short.data_sources.MassiveClient") as provider:
             provider.return_value.previous_close.side_effect = [PreviousClose(date(2026, 1, 2), 10), KeyboardInterrupt()]
             provider.return_value.minute_bars.return_value = self.bars()
             self.assertEqual(self.run_cli("--offline"), 130)
@@ -268,7 +315,7 @@ class CLITests(unittest.TestCase):
             def now(cls, tz=None):
                 return cls(2026, 1, 5, 9, 35, tzinfo=EASTERN).astimezone(tz)
 
-        with patch("four_am_short.cli.datetime", Clock), patch("four_am_short.cli.MassiveClient") as provider:
+        with patch("four_am_short.cli.datetime", Clock), patch("four_am_short.data_sources.MassiveClient") as provider:
             self.assertEqual(self.run_cli("--offline"), 3)
             provider.return_value.previous_close.assert_not_called()
             provider.return_value.minute_bars.assert_not_called()
@@ -276,7 +323,7 @@ class CLITests(unittest.TestCase):
         self.assertEqual(self.output.getvalue().strip().splitlines()[-1], "2026-01-05 | Net P/L: $0.00 (PARTIAL)")
 
     def test_interruption_saves_partial_report(self):
-        with patch("four_am_short.cli.MassiveClient") as provider:
+        with patch("four_am_short.data_sources.MassiveClient") as provider:
             provider.return_value.previous_close.side_effect = [PreviousClose(date(2026, 1, 2), 10), KeyboardInterrupt()]
             provider.return_value.minute_bars.return_value = self.bars()
             self.assertEqual(self.run_cli("--offline"), 130)
@@ -292,7 +339,7 @@ class CLITests(unittest.TestCase):
 
     def test_future_date_never_requests_prices_or_reports_zero_pnl_trade(self):
         self.input.write_text("2999-01-05 AAA\n")
-        with patch("four_am_short.cli.MassiveClient") as provider:
+        with patch("four_am_short.data_sources.MassiveClient") as provider:
             self.assertEqual(self.run_cli("--offline"), 3)
             provider.return_value.previous_close.assert_not_called()
         self.assertEqual(self.summary()[1]["statistics"]["incomplete"], 1)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare a finite re-entry grid with fixed first trades and chronological samples.
 
-Uses the backtest's Massive data and fill model. Never connects to a broker or
+Uses the backtest's selected data provider and fill model. Never connects to a broker or
 changes the shared/live trading configuration. Run with --offline for cache only.
 """
 
@@ -17,9 +17,9 @@ from dataclasses import asdict, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from four_am_short.config import ReentryConfig, clock, integer, iso_date, load_config, number, object_section, read_api_key
+from four_am_short.config import ReentryConfig, clock, integer, iso_date, load_config, number, object_section
+from four_am_short.data_sources import create_client
 from four_am_short.inputs import read_candidates
-from four_am_short.massive import MassiveClient
 from four_am_short.models import DataError, EASTERN, TradeResult
 from four_am_short.reports import monthly_summaries, summarize
 from four_am_short.reentry_sweep_sim import prepare_case, simulate_prepared
@@ -98,10 +98,7 @@ def ranking_key(row, prefix):
 
 
 def load_cases(config, offline, ready_clock):
-    key = None if offline else read_api_key(config.data)
-    if not offline and not key:
-        raise DataError(f"Set {config.data.api_key_env} or use --offline")
-    client = MassiveClient(config.data, key, offline=offline)
+    client = create_client(config.data, offline=offline)
     content = config.input_file.read_bytes()
     candidates = read_candidates(config, content=content)
     cases, initial_rows, source_cases = [], [], []
@@ -149,7 +146,7 @@ def markdown_table(items):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=PROJECT / "sweep_4am_short_reentry.json")
-    parser.add_argument("--offline", action="store_true", help="Use cached Massive data only")
+    parser.add_argument("--offline", action="store_true", help="Use cached data from the configured provider only")
     parser.add_argument("--output-dir", type=Path, help="Explicit directory; existing files are not overwritten")
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
@@ -244,6 +241,7 @@ def main(argv=None):
     manifest = {
         "created_at": datetime.now(EASTERN).isoformat(), "grid_combinations": len(results),
         "evaluations": len(results) * len(cases), "offline": args.offline,
+        "data_provider": config.data.provider,
         "input_file": str(config.input_file), "input_sha256": hashlib.sha256(input_content).hexdigest(),
         "config_path": str(config_path), "config_sha256": hashlib.sha256(original_bytes).hexdigest(),
         "configuration_unchanged": config_path.read_bytes() == original_bytes,

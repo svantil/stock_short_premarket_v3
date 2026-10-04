@@ -1,6 +1,6 @@
 # 4am short
 
-**4am short** (`strategy_id: 4am_short`) includes a Python backtest, a local dashboard, and a live supervisor for a premarket gap-and-pullback short setup. The supplied configuration keeps the original 04:00–04:15 Eastern setup and also discovers new qualifying stocks until 09:00. Backtests use a dated stock list and Massive historical data. Live discovery and quotes use Alpaca's live SIP websocket; locates, orders, and fills use the DAS Trader Pro CMD API. This directory is independent of `stock_short_premarket_v2` and imports no v2 code.
+**4am short** (`strategy_id: 4am_short`) includes a Python backtest, a local dashboard, and a live supervisor for a premarket gap-and-pullback short setup. The supplied configuration keeps the original 04:00–04:15 Eastern setup and also discovers new qualifying stocks until 09:00. Backtests use a dated stock list and selectable Massive or Alpaca SIP historical data. Live discovery and quotes use Alpaca's live SIP websocket; locates, orders, and fills use the DAS Trader Pro CMD API. This directory is independent of `stock_short_premarket_v2` and imports no v2 code.
 
 Live mode defaults to **monitor**, which simulates entries/exits from live quotes without sending locates or orders. The implementation has been checked with synthetic data and mock broker responses; an actual Alpaca SIP entitlement and the broker's DAS CMD session have not been exercised by these tests.
 
@@ -18,7 +18,7 @@ four_am_short/             # Python implementation
 four_am_short/live/        # Independent live feed, DAS, engine, and dashboard
 outcome/4am_short/          # Reports from new runs
 state/4am_short/            # Durable live attempts, order tokens, fills, and events
-.cache/massive/            # Reusable historical-data cache
+.cache/massive/            # Cache root; separate Massive and Alpaca SIP namespaces
 ```
 
 `four_am_short` spells out the number because Python package identifiers cannot begin with a digit. The legacy `backtest.py` command still launches this strategy, and `backtest.json` is a symlink to `backtest_4am_short.json`, keeping one configuration source. Existing reports retain their original names and locations.
@@ -32,7 +32,7 @@ cd /Users/stevevantil/stocks/stock_short_premarket_v3
 test -f .env || cp .env.example .env
 ```
 
-Set `MASSIVE_API_KEY` in `.env`, then edit `backtest_4am_short.json` as needed. An existing environment variable takes precedence over `.env`. Credentials stay outside the JSON configuration and reports.
+Set credentials for the chosen data provider in `.env`, then edit `backtest_4am_short.json` as needed. Massive remains the default and uses `MASSIVE_API_KEY`. Alpaca uses the same `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` as the live SIP feed. An existing environment variable takes precedence over `.env`. Credentials stay outside the JSON configuration and reports.
 
 ```sh
 # Check configuration and input without requesting market data.
@@ -56,7 +56,7 @@ python3 backtest_4am_short.py --config backtest_4am_short.json \
 
 Date bounds are inclusive. Candidates are deduplicated and sorted by date, then symbol; `--max-candidates` limits this filtered, sorted list. Validation fails if no candidates remain.
 
-Use `--offline` to rerun entirely from the local cache; missing cache entries become candidate errors. Use `--refresh-cache` to fetch fresh data. These two options cannot be combined. Historical access depends on the Massive account's entitlements; request errors are reported rather than replaced with invented prices.
+Use `--offline` to rerun entirely from the local cache; missing cache entries become candidate errors. Use `--refresh-cache` to fetch fresh data. These two options cannot be combined. Historical access depends on the selected provider's entitlements; request errors are reported rather than replaced with invented prices.
 
 Candidates whose configured time-exit minute has not yet finished are marked `incomplete` with reason `session_not_finished`, without fetching their prices. The run can still process earlier dates.
 
@@ -66,6 +66,39 @@ Today's candidates are supported online, including Massive responses with status
 # Run only today's candidates (example date).
 python3 backtest_4am_short.py --from-date 2026-09-23 --to-date 2026-09-23
 ```
+
+### Choose the backtest data provider
+
+Set `data.provider` in `backtest_4am_short.json` to `"massive"` or `"alpaca"`. Omitting it retains Massive for older configurations. The existing `backtest.json` symlink uses the same setting. The candidate input file does not determine the price-data provider.
+
+```json
+"data": {
+  "provider": "alpaca",
+  "api_key_env": "MASSIVE_API_KEY",
+  "alpaca_api_key_env": "ALPACA_API_KEY",
+  "alpaca_secret_key_env": "ALPACA_SECRET_KEY",
+  "env_file": ".env",
+  "cache_dir": ".cache/massive"
+}
+```
+
+You can override the JSON for one run without changing the file:
+
+```sh
+# Replay the SANG session using the same SIP feed as live discovery.
+.venv/bin/python backtest_4am_short.py --data-provider alpaca \
+  --from-date 2026-09-29 --to-date 2026-09-29 --symbols SANG
+
+# Select Massive for a comparison run.
+.venv/bin/python backtest_4am_short.py --data-provider massive \
+  --from-date 2026-09-29 --to-date 2026-09-29 --symbols SANG
+```
+
+Alpaca always requests **SIP** bars, with no IEX or cross-provider fallback. Credentials use the configured names, with `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY` accepted as aliases when using the default names. Environment credentials take precedence over `.env`. Historical backtests remain standard-library-only and never construct a broker client or submit orders.
+
+`--offline`, `--refresh-cache`, date/symbol filters and the re-entry sweep work with either provider. Both caches live under `data.cache_dir`, in separate `massive-v1/` and `alpaca_sip/` subdirectories; you do not need to change that path when switching. Today's minute bars and Alpaca split-normalization inputs are fetched fresh rather than cached. An offline replay of today is therefore unavailable; use a completed historical date. The offline excursion audit also honors the chosen provider and checks that it matches the source report.
+
+The console, text trade details, summary JSON and resolved configuration identify the selected source. The simulator and strategy rules are the same for both. Matching the live SIP feed removes a vendor difference, but historical bars still cannot reproduce quote spreads, bar revisions as received live, the final-bar verification wait, locate delays, or actual DAS execution.
 
 ## Run the dashboard and live supervisor
 
@@ -111,6 +144,10 @@ The dashboard never enables fresh entries on page load. Its Start button identif
 ```
 
 Use one supervisor per state/account identity. The state lock prevents duplicate v3 instances from managing the same strategy. Entries/attempts and broker tokens are persisted before order submission; restart restores unresolved orders/positions with new entries paused. The initial stock/date attempt is consumed once attempted, including a failed locate, except for the explicitly deferred unpaid eligibility checks described below. When re-entry is enabled, one separate attempt is permitted only after that initial position has fully closed by stop-loss. Failed initial attempts, other exits, and a second stop do not create further attempts. Existing unowned DAS positions or open orders in a candidate prevent a fresh trade.
+
+If startup says **Another 4am short process owns this live state**, another process still holds the operating-system lock. The error includes the lock path and the recorded PID when available (older versions did not record it). On macOS/Linux, run `lsof /path/to/the/printed.lock` to identify the owner, then `ps -p PID -o pid,ppid,stat,command` to inspect it. A `T` status means the process is suspended, often by **Ctrl-Z**: it retains its locks but cannot serve the dashboard or supervise exits. `jobs -l` in the original terminal also lists suspended jobs.
+
+Review any managed exposure in DAS before resuming or stopping a suspended supervisor. Bringing it back with `fg` resumes its code; shutting it down with **Ctrl-C** cancels pending entries and attempts to cover managed positions. Wait for shutdown to finish before launching again. Do not delete `.lock` files or switch state directories to bypass an owner. An unlocked leftover lock file is reused automatically; its existence alone never blocks startup.
 
 Once started or restoring saved exposure, the supervisor verifies DAS with a read-only account check every `das.health_check_seconds` (default **10**) and automatically reconnects and authenticates after failures, retrying every `das.reconnect_seconds` (default **5**). These checks continue after **Stop entries**; opening the UI alone does not connect to DAS. The dashboard shows the latest verified connection time and retry state. A disconnect blocks new entries without changing your Start/Stop choice; eligible, unattempted stocks may proceed once DAS recovers. Previously skipped attempts are not replayed. Existing broker orders can still fill during an outage, while the supervisor cannot manage positions or send covers; check open exposure in DAS. Wrong credentials or disabled CMD access require correction before a retry can succeed. Restart the Python service to load this change or connection-setting changes; refreshing the browser alone is insufficient.
 
@@ -189,7 +226,7 @@ The time exit takes precedence over later high/low prices within its minute. If 
 
 ### Comparing live trades with the backtest
 
-The regular backtest still uses Massive minute bars; live discovery uses Alpaca SIP. To isolate that data-source difference, run this after the session's configured exit window has finished:
+The regular backtest can use Massive or Alpaca SIP minute bars; live discovery uses Alpaca SIP. To compare saved live execution with a backtest report and a replay using the recorded live settings, run this after the session's configured exit window has finished:
 
 ```bash
 .venv/bin/python compare_4am_short_live.py --date 2026-09-23 --fetch-sip
@@ -252,12 +289,11 @@ steps, five stops, five targets, and 18 valid entry-deadline/time-exit pairs.
 .venv/bin/python sweep_4am_short_reentry.py --offline
 ```
 
-`--offline` uses the existing Massive cache without credentials or requests.
-Omit it to allow the ordinary cached Massive client to fetch missing historical
-data. The runner prepares completed first-trade stop-outs once, cross-checks
+`--offline` uses the selected provider's existing cache without credentials or requests.
+Omit it to allow the selected historical client to fetch missing data. The runner prepares completed first-trade stop-outs once, cross-checks
 every current-setting re-entry against the original simulator, and then compares
 settings using the same fill model. It never changes the active trading JSON or
-connects to Alpaca/DAS.
+connects to an execution broker.
 
 Results go into a new `outcome/reentry_sweep/` directory: all combinations,
 training and full-period rankings, entry-offset sensitivity with other current
@@ -329,9 +365,12 @@ The following parameters belong inside `data`:
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `api_key_env` | `"MASSIVE_API_KEY"` | Name of credential environment variable |
+| `provider` | `"massive"` | Historical provider: `massive` or `alpaca` (SIP only); CLI `--data-provider` overrides it |
+| `api_key_env` | `"MASSIVE_API_KEY"` | Massive credential environment variable |
+| `alpaca_api_key_env` | `"ALPACA_API_KEY"` | Alpaca key environment variable |
+| `alpaca_secret_key_env` | `"ALPACA_SECRET_KEY"` | Alpaca secret environment variable |
 | `env_file` | `".env"` | Optional credential file; `null` disables file lookup |
-| `cache_dir` | `".cache/massive"` | Local validated response cache |
+| `cache_dir` | `".cache/massive"` | Cache root; provider namespaces prevent collisions |
 | `timeout_seconds` | `30` | Timeout per HTTP request |
 | `max_retries` | `3` | Retries after the initial attempt |
 | `request_delay_seconds` | `0.25` | Minimum spacing between request starts |
@@ -476,7 +515,9 @@ Exit codes are `0` for a clean run (skips are allowed), `2` for configuration/in
 
 ## Historical data and limitations
 
-Prices come from Massive's [custom aggregate bars](https://massive.com/docs/rest/stocks/aggregates/custom-bars) and [daily ticker summary](https://massive.com/docs/rest/stocks/aggregates/daily-ticker-summary). Execution-day bars and source closes are requested unadjusted. The previous close is then normalized for [splits effective on the trade date](https://massive.com/docs/rest/stocks/corporate-actions/splits), preventing a reverse split from becoming a false gap. The previous session is identified first, and its close is requested for the candidate; the code does not silently substitute an older ticker close.
+With `data.provider: "massive"`, prices come from Massive's [custom aggregate bars](https://massive.com/docs/rest/stocks/aggregates/custom-bars) and [daily ticker summary](https://massive.com/docs/rest/stocks/aggregates/daily-ticker-summary). Execution-day bars and source closes are requested unadjusted. The previous close is then normalized for [splits effective on the trade date](https://massive.com/docs/rest/stocks/corporate-actions/splits), preventing a reverse split from becoming a false gap. The previous session is identified first, and its close is requested for the candidate; the code does not silently substitute an older ticker close.
+
+With `data.provider: "alpaca"`, prices come from [historical SIP bars](https://docs.alpaca.markets/us/reference/stockbars). Intraday prices stay raw/as traded. The exact preceding exchange session is identified from the configured calendar symbol's daily bars; a missing close for that session is an error. The regular-session close is normalized to the requested date's share basis using paired raw/split-adjusted bars for the prior session and a matching target-day minute. Taking the ratio cancels later splits, so a split after the backtest date does not rescale historical entry prices or the $1–$10 eligibility filter. Calibration inputs are saved together in one validated cache bundle; missing or inconsistent bars fail explicitly. Alpaca's `asof` parameter selects historical ticker mapping, not a cutoff date for split adjustments. Prices remain subject to provider adjustments, corrections and rounding.
 
 Minute aggregates contain eligible trades rather than quotes or every print. A minute without eligible trades can be absent, so sparse bars are accepted. The model does not infer spread, queue position, partial fills, borrow availability, DAS locate success, or the market impact of a 1,000-share order. Fees and slippage are configurable approximations. The supplied scanner list can introduce selection or survivorship bias. Backtest results depend on those inputs and execution assumptions.
 

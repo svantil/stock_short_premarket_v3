@@ -19,7 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import sweep_4am_short_reentry as runner
-from four_am_short.config import StrategyConfig
+from four_am_short.config import BacktestConfig, DataConfig, StrategyConfig
 from four_am_short.models import DataError, TradeResult
 
 
@@ -61,6 +61,29 @@ class SweepRunnerTests(unittest.TestCase):
         path = Path(folder) / "sweep.json"
         path.write_text(json.dumps(spec() if raw is None else raw))
         return path
+
+    def test_load_cases_uses_configured_provider_and_offline_mode(self):
+        with tempfile.TemporaryDirectory() as folder:
+            input_file = Path(folder) / "input.csv"
+            input_file.write_text("2026-01-02,TEST\n")
+            candidate = SimpleNamespace(trading_date=date(2026, 1, 2), symbol="TEST")
+            skipped = TradeResult("2026-01-02", "TEST", "skipped", "synthetic")
+            for provider in ("massive", "alpaca"):
+                with self.subTest(provider=provider):
+                    config = BacktestConfig(input_file, Path(folder), StrategyConfig(),
+                                            DataConfig(provider=provider))
+                    with patch.object(runner, "create_client") as factory, \
+                            patch.object(runner, "read_candidates", return_value=[candidate]), \
+                            patch.object(runner, "simulate", return_value=skipped), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        cases, initial, sources, content = runner.load_cases(config, True, "09:20")
+                    factory.assert_called_once_with(config.data, offline=True)
+                    factory.return_value.previous_close.assert_called_once_with("TEST", candidate.trading_date)
+                    factory.return_value.minute_bars.assert_called_once_with("TEST", candidate.trading_date)
+                    self.assertEqual(initial, [skipped])
+                    self.assertEqual(cases, [])
+                    self.assertEqual(sources, [])
+                    self.assertEqual(content, input_file.read_bytes())
 
     def test_approved_grid_has_all_5850_valid_combinations_including_equal_cutoffs(self):
         raw = spec()
@@ -215,6 +238,7 @@ class SweepRunnerTests(unittest.TestCase):
             self.assertEqual(load.call_args.args[2], "09:30")
             self.assertEqual(config_path.read_bytes(), original)
             manifest = json.loads((output / "sweep_manifest.json").read_text())
+            self.assertEqual(manifest["data_provider"], "massive")
             self.assertEqual(manifest["grid_combinations"], 3)
             self.assertEqual(manifest["training_stop_out_cases"], 2)
             self.assertEqual(manifest["validation_stop_out_cases"], 1)

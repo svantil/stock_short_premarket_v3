@@ -9,9 +9,9 @@ from datetime import datetime, time, timedelta
 from pathlib import Path
 
 from . import STRATEGY_ID, STRATEGY_NAME
-from .config import iso_date, load_config, read_api_key, symbol
+from .config import iso_date, load_config, symbol
+from .data_sources import create_client, provider_label
 from .inputs import read_candidates
-from .massive import MassiveClient
 from .models import EASTERN, DataError, TradeResult
 from .reports import format_gap_summary, format_monthly_summary, format_trade_summary, summarize, write_reports
 from .strategy import simulate_trades
@@ -23,12 +23,13 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--config", type=Path, default=Path(__file__).resolve().parents[1] / f"backtest_{STRATEGY_ID}.json")
     result.add_argument("--validate-only", action="store_true", help="Validate JSON and input without network requests")
     mode = result.add_mutually_exclusive_group()
-    mode.add_argument("--offline", action="store_true", help="Use cached Massive responses only; no API key required")
+    mode.add_argument("--offline", action="store_true", help="Use only the selected provider's cache; no credentials required")
     mode.add_argument("--refresh-cache", action="store_true", help="Fetch again and replace cached market data")
     result.add_argument("--from-date", help="Inclusive date filter, YYYY-MM-DD")
     result.add_argument("--to-date", help="Inclusive date filter, YYYY-MM-DD")
     result.add_argument("--symbols", nargs="+", help="Only these tickers")
     result.add_argument("--max-candidates", type=int, help="Limit sorted date/symbol pairs for a small trial")
+    result.add_argument("--data-provider", choices=("massive", "alpaca"), help="Override data.provider for this run (Alpaca uses SIP)")
     return result
 
 
@@ -36,6 +37,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         config = load_config(args.config)
+        if args.data_provider:
+            config = replace(config, data=replace(config.data, provider=args.data_provider))
         if args.from_date:
             config = replace(config, from_date=iso_date(args.from_date, "from-date"))
         if args.to_date:
@@ -50,14 +53,11 @@ def main(argv: list[str] | None = None) -> int:
             if args.max_candidates < 1:
                 raise DataError("max-candidates must be at least 1")
             candidates = candidates[:args.max_candidates]
-        print(f"Strategy: {STRATEGY_NAME}\nInput: {config.input_file}\nCandidates: {len(candidates)}; shares: {config.strategy.shares}; timezone: America/New_York", flush=True)
+        print(f"Strategy: {STRATEGY_NAME}\nData: {provider_label(config.data)}\nInput: {config.input_file}\nCandidates: {len(candidates)}; shares: {config.strategy.shares}; timezone: America/New_York", flush=True)
         if args.validate_only:
             print("Configuration and input are valid. No market-data requests made.")
             return 0
-        key = None if args.offline else read_api_key(config.data)
-        if not args.offline and not key:
-            raise DataError(f"Set {config.data.api_key_env} in your environment or {config.data.env_file}")
-        client = MassiveClient(config.data, key, offline=args.offline, refresh_cache=args.refresh_cache)
+        client = create_client(config.data, offline=args.offline, refresh_cache=args.refresh_cache)
         print("Trade times identify one-minute bars in Eastern time; high-bar and wait-reference times are shown separately.", flush=True)
         rows: list[TradeResult] = []
         interrupted = False

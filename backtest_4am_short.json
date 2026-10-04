@@ -1,8 +1,8 @@
 {
   "strategy_id": "4am_short",
   "strategy_name": "4am short",
-  "input_file": "../stock_daily_scanner/outcome/2026-NEW_all.csv",
-  "shares": 10,
+  "input_file": "../stock_daily_scanner/outcome/2026-NEW_all-alpaca.csv",
+  "shares": 20,
   "output_dir": "outcome/4am_short",
   "from_date": null,
   "to_date": null,
@@ -38,7 +38,10 @@
     }
   },
   "data": {
+    "provider": "alpaca",
     "api_key_env": "MASSIVE_API_KEY",
+    "alpaca_api_key_env": "ALPACA_API_KEY",
+    "alpaca_secret_key_env": "ALPACA_SECRET_KEY",
     "env_file": ".env",
     "cache_dir": ".cache/massive",
     "timeout_seconds": 30,
